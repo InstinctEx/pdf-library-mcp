@@ -11,6 +11,7 @@ This engine is optional. Nothing in the core pipeline requires it.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -20,15 +21,13 @@ import tempfile
 import time
 from pathlib import Path
 
+from ..blocks import page_methods_from_meta, parse_document
 from ..mathfix import repair_html_scripts
 from .base import (
     EngineUnavailable,
     ExtractedPage,
     ExtractionResult,
 )
-
-# marker's --paginate_output inserts a marker line between pages.
-_PAGE_SEPARATOR = re.compile(r"^\{(\d+)\}-{20,}\s*$", re.MULTILINE)
 
 # Failures worth translating into an instruction the user can act on.
 _KNOWN_FAILURES: tuple[tuple[str, str], ...] = (
@@ -148,6 +147,12 @@ class MarkerEngine:
     def extract(
         self, pdf_path: Path, pages: list[int] | None = None
     ) -> ExtractionResult:
+        """Run Marker and return per-page Markdown, blocks and OCR provenance.
+
+        JSON is requested rather than Markdown: it carries block bounding
+        boxes, block types, and how each page's text was obtained, none of
+        which survive Marker's Markdown renderer.
+        """
         binary = self._resolve()
         if not binary:
             raise EngineUnavailable(self.available()[1])
@@ -161,8 +166,11 @@ class MarkerEngine:
                 "--output_dir",
                 str(out_dir),
                 "--output_format",
-                "markdown",
-                "--paginate_output",
+                "json",
+                # Nothing here consumes extracted images, and skipping them
+                # saves both time and a great deal of temporary disk.
+                "--disable_image_extraction",
+                "--disable_tqdm",
                 *self.extra_args,
             ]
             if pages:
@@ -180,58 +188,50 @@ class MarkerEngine:
                     "marker_single failed: " + _explain(proc.stderr or proc.stdout)
                 )
 
-            md_files = sorted(out_dir.rglob("*.md"))
-            if not md_files:
-                raise EngineUnavailable("marker_single produced no markdown")
-            raw = md_files[0].read_text(encoding="utf-8")
+            document, meta = self._read_output(out_dir)
 
-        extracted = self._split_pages(raw, requested=pages)
+        page_blocks = parse_document(document, page_methods_from_meta(meta))
+        extracted: list[ExtractedPage] = []
+        for page in page_blocks:
+            # Marker emits real LaTeX for equations but still leaves stray
+            # HTML scripts in prose, so the same repair applies here.
+            markdown = repair_html_scripts(page.markdown)
+            extracted.append(
+                ExtractedPage(
+                    page_number=page.page_number,
+                    markdown=markdown,
+                    ocr_used=page.ocr_used,
+                    ocr_reason="surya" if page.ocr_used else None,
+                    blocks=page.blocks,
+                    page_width=page.width,
+                    page_height=page.height,
+                )
+            )
+
+        if pages and len(extracted) == len(pages):
+            # Marker numbers pages from its own page_range; trust the caller's
+            # numbering when the counts line up exactly.
+            for target, page in zip(sorted(pages), extracted):
+                page.page_number = target
+                for block in page.blocks:
+                    block.page_number = target
+
+        extracted.sort(key=lambda p: p.page_number)
         return ExtractionResult(
             engine=self.name,
             engine_version=self.version(),
-            pages=extracted,
+            pages=[p for p in extracted if p.markdown],
             duration_s=time.perf_counter() - started,
         )
 
-    # ------------------------------------------------------------------
-    def _split_pages(
-        self, markdown: str, requested: list[int] | None
-    ) -> list[ExtractedPage]:
-        """Turn marker's paginated output back into per-page Markdown.
-
-        The separator carries marker's own 0-based page index, which stays
-        correct under --page_range, so we trust it and only fall back to
-        positional mapping when the separators are missing.
-        """
-        matches = list(_PAGE_SEPARATOR.finditer(markdown))
-        if not matches:
-            targets = requested or [1]
-            return [ExtractedPage(page_number=targets[0], markdown=markdown.strip())]
-
-        pages: list[ExtractedPage] = []
-        for index, match in enumerate(matches):
-            start = match.end()
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
-            # Marker emits real LaTeX for equations but still leaves stray
-            # HTML scripts in prose, so the same repair applies here.
-            body = repair_html_scripts(markdown[start:end].strip())
-            number = int(match.group(1)) + 1
-            pages.append(ExtractedPage(page_number=number, markdown=body))
-
-        # Leading content before the first separator belongs to that page.
-        head = markdown[: matches[0].start()].strip()
-        if head and pages:
-            pages[0] = ExtractedPage(
-                page_number=pages[0].page_number,
-                markdown=f"{head}\n\n{pages[0].markdown}".strip(),
-            )
-
-        if requested and len(pages) == len(requested):
-            # Trust the caller's numbering when the counts line up exactly.
-            ordered = sorted(requested)
-            pages = [
-                ExtractedPage(page_number=ordered[i], markdown=p.markdown)
-                for i, p in enumerate(pages)
-            ]
-
-        return [p for p in pages if p.markdown]
+    @staticmethod
+    def _read_output(out_dir: Path) -> tuple[dict, dict]:
+        candidates = [p for p in out_dir.rglob("*.json") if "_meta" not in p.name]
+        if not candidates:
+            raise EngineUnavailable("marker_single produced no JSON output")
+        document = json.loads(candidates[0].read_text(encoding="utf-8"))
+        meta_path = candidates[0].with_name(candidates[0].stem + "_meta.json")
+        meta = {}
+        if meta_path.is_file():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        return document, meta

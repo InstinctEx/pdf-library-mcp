@@ -16,8 +16,9 @@ for instructions to the agent.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Image, MCPServer
 
 from .config import Config, load_config
 from .engines import EngineUnavailable, get_engine
@@ -173,7 +174,13 @@ def search_library(
             "Try fewer or more common words, or list_documents to see what is indexed."
         )
 
-    lines = [f"{len(results)} result(s) for {query!r}:", ""]
+    modes = {item["match"] for item in results}
+    header = f"{len(results)} result(s) for {query!r}"
+    if modes == {"approximate"}:
+        header += " (approximate: no exact match, these overlap on spelling)"
+    elif modes == {"partial"}:
+        header += " (partial: not every word appears in one passage)"
+    lines = [header + ":", ""]
     for item in results:
         pages = item["pages"]
         span = f"p{pages[0]}" if pages[0] == pages[1] else f"p{pages[0]}-{pages[1]}"
@@ -234,7 +241,24 @@ def get_pages(document: str, pages: list[int]) -> str:
         markdown = page["markdown"]
         if len(markdown) > page_budget:
             markdown = markdown[:page_budget] + "\n[page truncated]"
-        body_parts.append(f"\n## page {page['page']}\n\n{markdown}")
+        note = ""
+        if page["ocr_used"]:
+            # The reader has to know that prose on this page was guessed from
+            # an image, so that a strange word is read as an OCR error rather
+            # than as what the author wrote.
+            blocks = page["blocks"]
+            equations = [b["block"] for b in blocks if b["type"] == "Equation"]
+            note = (
+                "\n\n[page {n}: text recovered by OCR from a scan. Mathematics is "
+                "usually reliable, prose spelling less so. If something reads as "
+                "nonsense, call get_page_image(page={n}"
+            ).format(n=page["page"])
+            note += (
+                f", block={equations[0]}) — equation blocks here: {equations}]"
+                if equations
+                else ") to see the original.]"
+            )
+        body_parts.append(f"\n## page {page['page']}\n\n{markdown}{note}")
     return _budget("\n".join(body_parts), "request fewer pages")
 
 
@@ -296,6 +320,54 @@ def get_section(document: str, section: str) -> str:
         f"{CONTENT_BANNER}\n\n{data['content']}",
         "read individual pages instead",
     )
+
+
+# ----------------------------------------------------------------------
+@server.tool(
+    name="get_page_image",
+    description=(
+        "Show the original scanned page, or one region of it, as an image. "
+        "This is the expensive tool and the last resort: an image costs several "
+        "times what the same page's text costs, and it stays in context for the "
+        "rest of the conversation. Use it only when the extracted text is "
+        "evidently corrupted — nonsense words in a formula, an equation that "
+        "does not parse — and always pass a block number if you can, since "
+        "cropping to one equation is both cheaper and sharper than the whole "
+        "page. get_pages lists the block numbers for OCR'd pages."
+    ),
+    # The reply mixes a caption with an image, which has no structured form.
+    structured_output=False,
+)
+def get_page_image(
+    document: str, page: int, block: int | None = None, max_tokens: int = 900
+) -> list[Any]:
+    """Render the original of a page or block.
+
+    Args:
+        document: Document id, filename or title.
+        page: 1-based page number.
+        block: Block number from get_pages, to crop to that region only.
+        max_tokens: Approximate token budget for the image (default 900).
+    """
+    library = _library()
+    try:
+        budget = max(150, min(int(max_tokens), _config.response.max_image_tokens * 2))
+        region = library.render_page_region(
+            document, int(page), block=block, max_tokens=budget
+        )
+    except LibraryError as exc:
+        return [str(exc)]
+    finally:
+        library.close()
+
+    caption = (
+        f"page {region.page_number}"
+        + (f", block {block} (cropped)" if region.cropped else " (full page)")
+        + f" — {region.width}x{region.height}, about {region.estimated_tokens} tokens"
+    )
+    if region.note:
+        caption += f"\nNote: {region.note}"
+    return [caption, Image(data=region.data, format="jpeg")]
 
 
 # ----------------------------------------------------------------------
@@ -370,6 +442,11 @@ def document_status(document: str) -> str:
     ]
     if data["scanned_pages"]:
         lines.append(f"scanned pages (no text layer): {_compact(data['scanned_pages'])}")
+    if data["ocr_pages"]:
+        lines.append(
+            f"pages read by OCR (prose spelling is approximate): "
+            f"{_compact(data['ocr_pages'])}"
+        )
     if data["low_quality_pages"]:
         lines.append(f"low quality pages: {_compact(data['low_quality_pages'])}")
     if data["upgrade_candidates"]:

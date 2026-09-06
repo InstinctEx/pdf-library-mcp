@@ -59,6 +59,10 @@ class ResponseConfig:
     max_snippet_chars: int = 320
     max_page_chars: int = 12000
     max_response_tokens: int = 6000
+    # Ceiling for an explicitly requested page image. Images are far more
+    # expensive than text and persist in the conversation, so this is a hard
+    # cap rather than a default.
+    max_image_tokens: int = 900
 
 
 @dataclass(frozen=True)

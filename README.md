@@ -45,7 +45,8 @@ That layer is what this project is. Concretely, it adds:
   no extractor reports and no check on the output can see.
 - **Greek as a first-class language**, at every layer from OCR repair to search.
 - **An MCP interface built around a token budget**, where search returns
-  snippets and content arrives only when asked for.
+  snippets and content arrives only when asked for — including an image of the
+  original page, priced and opt-in, for when the text cannot be trusted.
 
 Forking any single extractor would have meant inheriting its licence and its
 scope while still writing all of the above. Depending on them behind an
@@ -106,7 +107,26 @@ light Greek stemmer, with identical treatment of queries. LaTeX is stripped from
 the indexed text as well, so `\int_{-\infty}^{\infty}` cannot pollute ranking
 while the readable Markdown keeps it untouched.
 
-### 3. No OCR model knows Greek mathematical notation
+### 3. Search has to survive the OCR, not assume it
+
+Two separate problems, two separate answers. Greek inflection is regular, so a
+stemmer handles it. OCR damage is not: *παραγοντική* read as *παραχουτική*
+differs in two places at once, and no rule recovers that.
+
+So search widens in three stages, and stops at the first that finds anything:
+
+| Stage | Matches | Reported as |
+| --- | --- | --- |
+| exact | every word present, after folding and stemming | `exact` |
+| partial | any word present | `partial` |
+| approximate | character trigrams overlap | `approximate` |
+
+The trigram index is scored an order of magnitude lower than real word
+matches, so it can never outrank them — it only exists for the case where
+nothing else found anything. Results carry the stage that produced them,
+because an approximate match deserves to be read as one.
+
+### 4. No OCR model knows Greek mathematical notation
 
 Greek textbooks write the trigonometric functions with Greek names: `ημ` for
 sine, `συν` for cosine, `εφ` for tangent. Two things go wrong, and both are
@@ -125,7 +145,57 @@ deterministically — inside math spans only, so ordinary words like *ημέρα
 using that notation, and `pdf-library repair` applies it to documents already on
 disk without re-running OCR.
 
+### 5. Lecture notes have structure, just not Markdown structure
+
+Handwritten notes contain no headings, so size-based chunking produced a dozen
+untitled fragments. But the structure is there in the words: *Παράδειγμα*,
+*Λύση*, *Περίπτωση 2*, *Βήμα 3*, *Θεώρημα 2.5*. Those are recognised on their
+folded stems and become both the chunk heading and its type, which makes
+`search --type solution` and `get_section` work on material that has no
+headings at all.
+
 ---
+
+## The image escape hatch
+
+Extraction of handwriting will never be perfect, and no amount of repair
+changes that. So there is one tool that shows the reader the original — and it
+is the only expensive thing here, which is why it is opt-in and priced.
+
+Measured on a page of handwritten Greek notes:
+
+| | tokens | vs. the page's text |
+| --- | --- | --- |
+| The page's extracted text | 364 | — |
+| Full page image, 150 dpi | 2318 | 6.4× |
+| **One equation, cropped** | **385** | **1.1×** |
+
+Cropping is not just cheaper — at the same budget the equation is rendered
+1510×448 instead of 692×977, so it is both cheaper *and* sharper than the page
+that contains it. Because Marker's JSON output gives a bounding box for every
+block, `get_pages` tells the reader which blocks on an OCR'd page are equations,
+and `get_page_image(page=4, block=2)` shows exactly that one.
+
+Images are never returned by any other tool, never automatically, and the
+render scale is derived from a token budget rather than a DPI, so asking for
+"about 400 tokens" gets the largest image that fits.
+
+## On speed
+
+Both tiers are bounded by third-party model inference, and the rest was
+measured rather than assumed:
+
+- The fast tier runs at ~27 pages/second, of which 96% is PyMuPDF's ONNX layout
+  model. It cannot be switched off — pymupdf4llm requires it — so that is the
+  floor.
+- Marker runs at ~0.1 pages/second. A `reprocess` of many pages is already a
+  single invocation, so the model load is paid once rather than per page.
+- Everything else is noise: opening the library and running a search costs
+  0.55 ms, so the MCP server's per-call setup is not worth caching.
+
+The real speed feature is that none of this happens twice. A re-import is a
+cache hit in about a millisecond, reindexing never re-extracts, and `repair`
+fixes stored text without touching OCR.
 
 ## Install
 
@@ -160,6 +230,8 @@ pdf-library section real-analysis "Dominated Convergence"
 pdf-library report real-analysis --problems-only
 pdf-library reprocess real-analysis --pages 243
 pdf-library repair real-analysis               # Greek notation, no OCR
+pdf-library blocks real-analysis 243           # laid-out regions of a page
+pdf-library image real-analysis 243 --block 2  # crop one region to a JPEG
 pdf-library reindex --all
 pdf-library doctor
 ```
@@ -200,6 +272,7 @@ For Claude Desktop, in `claude_desktop_config.json`:
 | `get_section` | Every chunk under one heading |
 | `list_documents` | The library, metadata only |
 | `document_status` | Progress, quality report, pages worth upgrading |
+| `get_page_image` | The original page, or one cropped block, as an image. Opt-in and priced |
 | `reprocess` | Re-extracts named pages with Marker |
 
 Imports never block the transport: `import_pdf` returns a job id and
@@ -261,13 +334,14 @@ PDF.
 .venv/bin/python -m pytest tests -q
 ```
 
-99 tests. Fixtures are compiled from LaTeX so the mathematics has a known ground
-truth; regenerate them with `python tests/fixtures/make_fixtures.py`.
+138 tests. Fixtures are compiled from LaTeX so the mathematics has a known
+ground truth; regenerate them with `python tests/fixtures/make_fixtures.py`.
 
 The suite covers the promises that matter: a second import runs no engine, a
 digital PDF triggers no OCR, a display equation is never split across chunks,
-Greek queries match across inflections, and every MCP tool answers within its
-token budget.
+Greek queries match across inflections and across OCR damage, an exact match is
+never reported as approximate, images stay inside their token budget, and every
+MCP tool answers within its own.
 
 ---
 
@@ -282,6 +356,9 @@ thing work well:
   belongs on the handful of pages that fail it, opt-in, never on all of them.
 - A third extraction engine. Two tiers cover the range; a third is weight
   without a measured gain.
+- A spelling dictionary for OCR'd Greek prose. One wrong "correction" in a
+  mathematical text is worse than visible nonsense; the trigram index and the
+  image escape hatch solve the same problem without that risk.
 - Anything server-shaped: no Postgres, no queue, no web frontend. It is a local
   tool for one person's bookshelf.
 

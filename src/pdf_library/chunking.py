@@ -14,24 +14,52 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .normalize import fold
 from .quality import count_math
 
 _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
+
+# Lecture notes and handwritten material carry no Markdown headings at all;
+# their structure is carried by words. These are the words Greek and English
+# mathematical texts use to open a unit of thought, matched on their folded
+# stems so that accents and case do not matter.
+_SECTION_WORDS: tuple[str, ...] = (
+    "παραδειγμ", "εφαρμογ", "ασκησ", "λυσ", "περιπτωσ", "παρατηρησ",
+    "θεωρημ", "ορισμ", "αποδειξ", "προτασ", "λημμ", "πορισμ", "σημειωσ",
+    "μεθοδ", "κριτηρι", "βημ", "ερωτησ", "συμπερασμ",
+    "example", "exercise", "solution", "theorem", "definition", "proof",
+    "lemma", "corollary", "remark", "proposition", "method", "step", "case",
+)
+# The marker word, an optional number ("Περίπτωση 2", "Θεώρημα 2.5"), then a
+# separator or the end of the line.
+_SECTION_MARKER = re.compile(
+    r"^\s{0,3}[*_>#\s]{0,4}"
+    r"(?P<word>[^\W\d_]{3,20})"
+    r"(?P<number>\s+\d+(?:\.\d+)*)?"
+    r"\s*(?P<sep>[:.\u0387)\]]|\s|$)"
+)
 _FENCE = re.compile(r"^\s*(```|~~~)")
 _DISPLAY_OPEN = re.compile(r"(?<!\\)\$\$")
 _TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
 
-_TYPE_WORDS = {
-    "theorem": ("theorem", "θεώρημα"),
-    "lemma": ("lemma", "λήμμα"),
-    "proof": ("proof", "απόδειξη"),
-    "definition": ("definition", "ορισμός", "ορισμοσ"),
-    "example": ("example", "παράδειγμα"),
-    "corollary": ("corollary", "πόρισμα"),
-    "remark": ("remark", "παρατήρηση"),
-    "proposition": ("proposition", "πρόταση"),
-    "exercise": ("exercise", "άσκηση"),
-}
+# Chunk type by the word that opens the passage, matched on folded stems so
+# that case, accents and inflection do not matter.
+_TYPE_STEMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("theorem", ("θεωρημ", "theorem")),
+    ("lemma", ("λημμ", "lemma")),
+    ("proof", ("αποδειξ", "proof")),
+    ("definition", ("ορισμ", "definition")),
+    ("example", ("παραδειγμ", "example")),
+    ("corollary", ("πορισμ", "corollary")),
+    ("remark", ("παρατηρησ", "σημειωσ", "remark", "note")),
+    ("proposition", ("προτασ", "proposition")),
+    ("exercise", ("ασκησ", "ερωτησ", "exercise")),
+    ("solution", ("λυσ", "solution")),
+    ("case", ("περιπτωσ", "case")),
+    ("step", ("βημ", "step")),
+    ("method", ("μεθοδ", "κριτηρι", "method")),
+    ("application", ("εφαρμογ", "application")),
+)
 
 
 @dataclass
@@ -53,16 +81,47 @@ class Chunk:
 
 
 def classify(heading: str | None, body: str) -> str:
-    """Label a chunk by the mathematical object it appears to hold."""
-    probe = f"{heading or ''}\n{body[:160]}".lower()
-    for label, words in _TYPE_WORDS.items():
-        if any(w in probe for w in words):
+    """Label a chunk by the mathematical object it appears to hold.
+
+    The heading decides when there is one, since a passage opening with
+    "Απόδειξη" is a proof whatever else it mentions; only then does the body
+    get a say.
+    """
+    if heading:
+        folded = fold(heading)
+        for label, stems in _TYPE_STEMS:
+            if any(folded.startswith(stem) for stem in stems):
+                return label
+
+    probe = fold(f"{heading or ''}\n{body[:160]}")
+    for label, stems in _TYPE_STEMS:
+        if any(stem in probe for stem in stems):
             return label
     if body.count("$$") >= 2 and len(body.strip()) < 400:
         return "equation"
     if sum(1 for line in body.splitlines() if _TABLE_ROW.match(line)) >= 3:
         return "table"
     return "paragraph"
+
+
+def section_marker(line: str) -> str | None:
+    """Return the heading a line opens, if it opens one.
+
+    Returns the marker phrase itself ("Περίπτωση 2") rather than the whole
+    line, so that a heading stays short enough to be useful in a search result.
+    """
+    stripped = line.strip()
+    if not stripped or len(stripped) > 200:
+        return None
+    match = _SECTION_MARKER.match(stripped)
+    if not match:
+        return None
+    word = match.group("word")
+    folded = fold(word)
+    if not any(folded.startswith(root) for root in _SECTION_WORDS):
+        return None
+    number = (match.group("number") or "").strip()
+    return f"{word} {number}".strip()
 
 
 @dataclass
@@ -72,7 +131,11 @@ class _Block:
     lines: list[str]
     page: int
     heading: str | None
+    # A line that is nothing but a heading, such as "## Proof".
     is_heading: bool
+    # A line that announces a section and also carries its first sentence,
+    # which is how unstructured lecture notes are written: "Λύση Θέτουμε u = x".
+    starts_section: bool = False
 
 
 def _blocks(page_number: int, markdown: str) -> list[_Block]:
@@ -108,6 +171,16 @@ def _blocks(page_number: int, markdown: str) -> list[_Block]:
         if heading:
             flush()
             out.append(_Block([line], page_number, heading.group(2).strip(), True))
+            continue
+
+        marker = section_marker(line)
+        if marker:
+            # The line is both the heading and the start of the body, so it is
+            # kept whole and only tagged with the section it announces.
+            flush()
+            out.append(
+                _Block([line], page_number, marker, False, starts_section=True)
+            )
             continue
 
         if not line.strip():
@@ -163,16 +236,20 @@ def chunk_pages(
         size = sum(len(line) for line in block.lines)
         current_size = sum(len(l) for b in current for l in b.lines)
 
+        if block.starts_section:
+            # This line carries content, so it always opens a fresh chunk.
+            emit()
+            heading = block.heading
+            current.append(block)
+            continue
+
         if block.is_heading:
-            # A new heading starts a new chunk, unless the current one holds
-            # nothing but the previous heading line.
+            # A bare heading opens a new chunk, unless the current one holds
+            # nothing but the previous heading line, in which case the two
+            # headings belong together.
             if current and not all(b.is_heading for b in current):
                 emit()
-                heading = block.heading
-            elif current:
-                heading = block.heading
-            else:
-                heading = block.heading
+            heading = block.heading
             current.append(block)
             continue
 

@@ -8,6 +8,7 @@ that decides whether work can be skipped.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -15,21 +16,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .chunking import chunk_pages
+from .chunking import Chunk, chunk_pages
 from .config import Config, load_config
-from .db import INDEX_VERSION, SCHEMA_VERSION, init_db
+from .db import INDEX_VERSION, SCHEMA_VERSION, init_db, rebuild_index
 from .engines import EngineUnavailable, get_engine
-from .engines.base import ExtractionResult
+from .engines.base import ExtractedPage, ExtractionResult
 from .hashing import document_id as make_document_id
 from .greek_math import looks_greek_mathematical
 from .greek_math import repair as repair_greek_math
 from .hashing import file_sha256, text_sha256
-from .normalize import normalize_for_index, normalize_query
+from .normalize import normalize_for_index, normalize_query, trigrams
 from .quality import assess_page, looks_mathematical
+from .rendering import RenderedRegion, render_region
 from .storage import DocumentStore
 from .tokens import estimate_tokens
 
 ProgressFn = Callable[[float, str], None]
+
+# Display and inline math, removed before judging what language a page is in.
+_MATH_SPAN = re.compile(r"\$\$.+?\$\$|(?<!\\)\$.+?(?<!\\)\$", re.DOTALL)
 
 
 def _now() -> str:
@@ -367,7 +372,10 @@ class Library:
 
             quality = assess_page(page.markdown)
             is_scanned = page.page_number in scanned_pages
-            needs_ocr = is_scanned and not quality.has_text
+            # An engine that tells us how it read the page is believed; only
+            # when it says nothing do we fall back to inferring from the scan
+            # inspection.
+            needs_ocr = is_scanned and not quality.has_text and not page.ocr_used
             mathematical = looks_mathematical(page.markdown, greek_document)
 
             # A page typeset with TeX's large-operator and extensible-delimiter
@@ -382,6 +390,7 @@ class Library:
                 mathematical = True
 
             store.write_page(page.page_number, page.markdown)
+            self._store_blocks(document_id, page)
             self.conn.execute(
                 """
                 INSERT INTO pages (
@@ -437,13 +446,50 @@ class Library:
             "greek_math_repairs": repairs,
         }
 
+    def _store_blocks(self, document_id: str, page: ExtractedPage) -> None:
+        """Replace the stored blocks for one page."""
+        self.conn.execute(
+            "DELETE FROM blocks WHERE document_id = ? AND page_number = ?",
+            (document_id, page.page_number),
+        )
+        if not page.blocks:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO blocks (
+                document_id, page_number, ordinal, block_type,
+                x0, y0, x1, y1, page_width, page_height, char_count
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            [
+                (
+                    document_id,
+                    page.page_number,
+                    ordinal,
+                    block.block_type,
+                    *(block.bbox or (None, None, None, None)),
+                    page.page_width or None,
+                    page.page_height or None,
+                    len(block.markdown),
+                )
+                for ordinal, block in enumerate(page.blocks)
+            ],
+        )
+
     @staticmethod
     def _is_greek(result: ExtractionResult) -> bool:
-        sample = "".join(p.markdown for p in result.pages[:20])[:20000]
+        """Decide the document's language from its prose, not its formulas.
+
+        LaTeX is written in Latin letters -- ``\operatorname``, ``\int``,
+        ``aligned`` -- and a mathematical page carries enough of it to drown
+        out the Greek around it, so math spans are removed before counting.
+        """
+        sample = "".join(p.markdown for p in result.pages[:20])[:40000]
         if not sample:
             return False
-        greek = sum(1 for ch in sample if "Ͱ" <= ch <= "Ͽ" or "ἀ" <= ch <= "῿")
-        letters = sum(1 for ch in sample if ch.isalpha())
+        prose = _MATH_SPAN.sub(" ", sample)
+        greek = sum(1 for ch in prose if "Ͱ" <= ch <= "Ͽ" or "ἀ" <= ch <= "῿")
+        letters = sum(1 for ch in prose if ch.isalpha())
         return letters > 0 and greek / letters > 0.3
 
     # ------------------------------------------------------------------
@@ -463,16 +509,29 @@ class Library:
             max_chars=self.config.chunking.max_chars,
         )
 
+        try:
+            self._write_chunks(document_id, chunks)
+        except sqlite3.DatabaseError:
+            # The index is derived data. If it has fallen out of step with the
+            # chunks table -- an interrupted migration, say -- deleting a chunk
+            # reports the database as malformed. Rebuilding costs nothing that
+            # cannot be recreated, so heal and retry once.
+            rebuild_index(self.conn)
+            self._write_chunks(document_id, chunks)
+        return len(chunks)
+
+    def _write_chunks(self, document_id: str, chunks: list[Chunk]) -> None:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             self.conn.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+            prepared = [(c, normalize_for_index(c.content)) for c in chunks]
             self.conn.executemany(
                 """
                 INSERT INTO chunks (
                     document_id, page_start, page_end, ordinal, heading,
-                    chunk_type, content, search_text, char_count,
+                    chunk_type, content, search_text, fuzzy, char_count,
                     token_estimate, math_count
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -483,19 +542,19 @@ class Library:
                         c.heading,
                         c.chunk_type,
                         c.content,
-                        normalize_for_index(c.content),
+                        search_text,
+                        trigrams(search_text),
                         c.char_count,
                         estimate_tokens(c.content),
                         c.math_count,
                     )
-                    for c in chunks
+                    for c, search_text in prepared
                 ],
             )
             self.conn.execute("COMMIT")
         except BaseException:
             self.conn.execute("ROLLBACK")
             raise
-        return len(chunks)
 
     def repair_document(self, document_ref: str) -> dict[str, Any]:
         """Re-apply the Greek notation repairs to a document already on disk.
@@ -694,9 +753,16 @@ class Library:
             "SELECT COUNT(*) FROM pages WHERE document_id=? AND quality_tier='fast'",
             (row["id"],),
         ).fetchone()[0]
+        # A scanned document yields no text at all on the fast tier, so its
+        # language could not be judged at import. Now that there is prose to
+        # look at, record what it actually is.
         self.conn.execute(
-            "UPDATE documents SET quality_tier=? WHERE id=?",
-            ("high" if remaining == 0 else "mixed", row["id"]),
+            "UPDATE documents SET quality_tier=?, language=? WHERE id=?",
+            (
+                "high" if remaining == 0 else "mixed",
+                stats["language"],
+                row["id"],
+            ),
         )
         progress(1.0, "done")
 
@@ -720,21 +786,64 @@ class Library:
         limit: int | None = None,
         chunk_type: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Search the library, widening only as far as it has to.
+
+        Three stages, each tried only when the previous found nothing: all
+        terms present, any term present, then a character-trigram match that
+        tolerates OCR damage. Results carry the stage that found them, because
+        an approximate match deserves to be read as one.
+        """
         limit = limit or self.config.search.max_results
         normalized = normalize_query(query)
         if not normalized:
             return []
 
+        phrase = '"' in normalized
+        terms = normalized.split()
+
+        attempts: list[tuple[str, str]] = [
+            ("exact", f"{{search_text heading}} : ({normalized})")
+        ]
+        if not phrase and len(terms) > 1:
+            # FTS5 ANDs terms by default, which returns nothing as soon as one
+            # word is absent from an otherwise perfect passage.
+            attempts.append(
+                ("partial", "{search_text heading} : (" + " OR ".join(terms) + ")")
+            )
+        if not phrase:
+            grams = trigrams(normalized).split()
+            if grams:
+                attempts.append(("approximate", "{fuzzy} : (" + " OR ".join(grams) + ")"))
+
+        for mode, expression in attempts:
+            rows = self._run_search(
+                expression, document_id, pages, chunk_type, limit
+            )
+            if rows:
+                return [self._search_result(row, mode) for row in rows]
+        return []
+
+    def _run_search(
+        self,
+        expression: str,
+        document_id: str | None,
+        pages: tuple[int, int] | None,
+        chunk_type: str | None,
+        limit: int,
+    ) -> list[sqlite3.Row]:
         sql = [
             "SELECT c.id, c.document_id, c.page_start, c.page_end, c.heading,",
             "       c.chunk_type, c.content, c.token_estimate, c.math_count,",
-            "       d.title, d.filename, bm25(chunks_fts) AS score",
+            "       d.title, d.filename,",
+            # Weights: a hit in a heading counts double, and the trigram column
+            # is scored low so it can never outrank a real word match.
+            "       bm25(chunks_fts, 1.0, 2.0, 0.1) AS score",
             "  FROM chunks_fts",
             "  JOIN chunks c ON c.id = chunks_fts.rowid",
             "  JOIN documents d ON d.id = c.document_id",
             " WHERE chunks_fts MATCH ?",
         ]
-        params: list[Any] = [normalized]
+        params: list[Any] = [expression]
         if document_id:
             sql.append("   AND c.document_id = ?")
             params.append(self.resolve(document_id)["id"])
@@ -747,40 +856,38 @@ class Library:
         sql.append(" ORDER BY score LIMIT ?")
         params.append(limit)
 
-        statement = "\n".join(sql)
         try:
-            rows = self.conn.execute(statement, params).fetchall()
-            if not rows:
-                # FTS5 ANDs terms by default, which returns nothing as soon as
-                # one word is absent. Retry as OR so a near miss still helps.
-                terms = normalized.split()
-                if len(terms) > 1 and '"' not in normalized:
-                    params[0] = " OR ".join(terms)
-                    rows = self.conn.execute(statement, params).fetchall()
+            return self.conn.execute("\n".join(sql), params).fetchall()
         except sqlite3.OperationalError as exc:
             raise LibraryError(f"bad search query: {exc}") from exc
 
-        snippet_chars = self.config.response.max_snippet_chars
-        return [
-            {
-                "chunk_id": r["id"],
-                "document_id": r["document_id"],
-                "document": r["title"] or r["filename"],
-                "pages": [r["page_start"], r["page_end"]],
-                "heading": r["heading"],
-                "type": r["chunk_type"],
-                "math_count": r["math_count"],
-                "token_estimate": r["token_estimate"],
-                "score": round(-r["score"], 3),
-                "snippet": _snippet(r["content"], snippet_chars),
-            }
-            for r in rows
-        ]
+    def _search_result(self, row: sqlite3.Row, mode: str) -> dict[str, Any]:
+        return {
+            "chunk_id": row["id"],
+            "document_id": row["document_id"],
+            "document": row["title"] or row["filename"],
+            "pages": [row["page_start"], row["page_end"]],
+            "heading": row["heading"],
+            "type": row["chunk_type"],
+            "math_count": row["math_count"],
+            "token_estimate": row["token_estimate"],
+            "score": round(-row["score"], 3),
+            "match": mode,
+            "snippet": _snippet(row["content"], self.config.response.max_snippet_chars),
+        }
 
     def get_pages(self, document_ref: str, pages: Iterable[int]) -> dict[str, Any]:
         row = self.resolve(document_ref)
         store = self.store(row["id"])
         wanted = sorted({int(p) for p in pages})
+        provenance = {
+            r["page_number"]: r
+            for r in self.conn.execute(
+                "SELECT page_number, ocr_used, quality_state, quality_score "
+                "  FROM pages WHERE document_id = ?",
+                (row["id"],),
+            )
+        }
         out: list[dict[str, Any]] = []
         missing: list[int] = []
         for number in wanted:
@@ -788,7 +895,19 @@ class Library:
             if markdown is None:
                 missing.append(number)
                 continue
-            out.append({"page": number, "markdown": markdown})
+            info = provenance.get(number)
+            out.append(
+                {
+                    "page": number,
+                    "markdown": markdown,
+                    "ocr_used": bool(info["ocr_used"]) if info else False,
+                    "quality": info["quality_state"] if info else None,
+                    "score": info["quality_score"] if info else None,
+                    "blocks": self.page_blocks(row["id"], number)
+                    if info and info["ocr_used"]
+                    else [],
+                }
+            )
         return {
             "document_id": row["id"],
             "document": row["title"] or row["filename"],
@@ -796,6 +915,79 @@ class Library:
             "missing": missing,
             "page_count": row["page_count"],
         }
+
+    def page_blocks(self, document_ref: str, page: int) -> list[dict[str, Any]]:
+        """The laid-out regions of one page, when the engine reported them."""
+        row = self.resolve(document_ref)
+        rows = self.conn.execute(
+            "SELECT ordinal, block_type, x0, y0, x1, y1, char_count "
+            "  FROM blocks WHERE document_id = ? AND page_number = ? "
+            " ORDER BY ordinal",
+            (row["id"], page),
+        ).fetchall()
+        return [
+            {
+                "block": r["ordinal"],
+                "type": r["block_type"],
+                "bbox": (
+                    None
+                    if r["x0"] is None
+                    else (r["x0"], r["y0"], r["x1"], r["y1"])
+                ),
+                "chars": r["char_count"],
+            }
+            for r in rows
+        ]
+
+    def render_page_region(
+        self,
+        document_ref: str,
+        page: int,
+        block: int | None = None,
+        max_tokens: int = 900,
+    ) -> RenderedRegion:
+        """Render the original of a page, or of one block on it.
+
+        Cropping is the point: at the same token budget a single equation is
+        rendered several times larger than the whole page around it.
+        """
+        row = self.resolve(document_ref)
+        store = self.store(row["id"])
+        bbox = None
+        note = ""
+
+        if block is not None:
+            found = self.conn.execute(
+                "SELECT block_type, x0, y0, x1, y1 FROM blocks "
+                " WHERE document_id = ? AND page_number = ? AND ordinal = ?",
+                (row["id"], page, block),
+            ).fetchone()
+            if found is None:
+                available = self.page_blocks(row["id"], page)
+                if not available:
+                    note = (
+                        "this document has no block layout recorded; "
+                        "reprocess it with the quality engine to get one. "
+                        "Showing the whole page."
+                    )
+                else:
+                    raise LibraryError(
+                        f"page {page} has no block {block}; "
+                        f"blocks are 0-{len(available) - 1}"
+                    )
+            elif found["x0"] is None:
+                note = "that block has no recorded position; showing the whole page."
+            else:
+                bbox = (found["x0"], found["y0"], found["x1"], found["y1"])
+
+        try:
+            region = render_region(
+                store.source_pdf, page, bbox=bbox, max_tokens=max_tokens
+            )
+        except ValueError as exc:
+            raise LibraryError(str(exc)) from exc
+        region.note = note
+        return region
 
     def get_chunk(self, chunk_id: int) -> dict[str, Any]:
         row = self.conn.execute(
@@ -906,7 +1098,10 @@ class Library:
                 "equations": aggregate["equations"],
                 "tables": aggregate["tables"],
                 "avg_quality": round(aggregate["avg_score"], 3),
+                # Pages still waiting for OCR, and pages whose text came from
+                # it -- different questions, and both worth answering.
                 "scanned_pages": self._pages_where("needs_ocr = 1", row["id"]),
+                "ocr_pages": self._pages_where("ocr_used = 1", row["id"]),
                 "low_quality_pages": self._pages_where(
                     "quality_state IN ('warning','bad')", row["id"]
                 ),

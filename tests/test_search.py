@@ -120,3 +120,46 @@ def test_reindex_all_marks_the_index_current(library: Library, math_pdf: Path) -
 
 def test_a_fresh_library_is_never_stale(library: Library) -> None:
     assert not library.index_is_stale()
+
+
+def test_search_widens_only_when_it_has_to(library: Library, math_pdf: Path) -> None:
+    """An exact match must never be reported as approximate."""
+    library.import_pdf(math_pdf)
+    results = library.search("convergence")
+    assert results
+    assert all(r["match"] == "exact" for r in results)
+
+
+def test_ocr_damage_is_reached_by_trigrams(library: Library, math_pdf: Path) -> None:
+    """The case this index exists for: two errors in one word."""
+    result = library.import_pdf(math_pdf)
+    store = library.store(result.document_id)
+    store.write_page(1, "Η παραχουτική ολοκλήρωση κατά μέρη.")
+    library.reindex_document(result.document_id)
+
+    exact = library.search("παραχουτική")
+    assert exact and exact[0]["match"] == "exact"
+
+    corrected = library.search("παραγοντική")
+    assert corrected, "a two-character OCR error must still be reachable"
+    assert corrected[0]["match"] == "approximate"
+
+
+def test_short_queries_do_not_trigger_fuzzy_noise(
+    library: Library, math_pdf: Path
+) -> None:
+    library.import_pdf(math_pdf)
+    # Words below the trigram threshold produce no fuzzy tokens at all.
+    assert library.search("zzz") == []
+
+
+def test_fuzzy_never_outranks_exact(library: Library, math_pdf: Path) -> None:
+    result = library.import_pdf(math_pdf)
+    store = library.store(result.document_id)
+    store.write_page(1, "# Convergence\n\nThe dominated convergence theorem.")
+    store.write_page(2, "Convrgence spelled wrongly throughout this page.")
+    library.reindex_document(result.document_id)
+
+    top = library.search("convergence")[0]
+    assert top["match"] == "exact"
+    assert top["pages"][0] == 1

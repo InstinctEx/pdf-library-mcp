@@ -150,6 +150,40 @@ def cmd_reprocess(args: argparse.Namespace, library: Library) -> int:
     return 0
 
 
+def cmd_image(args: argparse.Namespace, library: Library) -> int:
+    region = library.render_page_region(
+        args.document, args.page, block=args.block, max_tokens=args.max_tokens
+    )
+    output = args.output or Path(
+        f"page-{region.page_number:04d}"
+        + (f"-block{args.block}" if region.cropped else "")
+        + ".jpg"
+    )
+    output.write_bytes(region.data)
+    print(
+        f"{output}: {region.width}x{region.height}, "
+        f"~{region.estimated_tokens} tokens"
+        + (" (cropped)" if region.cropped else " (full page)")
+    )
+    if region.note:
+        print(f"note: {region.note}")
+    return 0
+
+
+def cmd_blocks(args: argparse.Namespace, library: Library) -> int:
+    blocks = library.page_blocks(args.document, args.page)
+    if not blocks:
+        print("No block layout recorded for this page. Reprocess with the "
+              "quality engine to get one.")
+        return 1
+    print(f"{'block':>5} {'type':<16} {'chars':>6}  bbox")
+    for item in blocks:
+        box = item["bbox"]
+        pretty = "-" if box is None else ", ".join(f"{v:.0f}" for v in box)
+        print(f"{item['block']:>5} {item['type']:<16} {item['chars']:>6}  {pretty}")
+    return 0
+
+
 def cmd_repair(args: argparse.Namespace, library: Library) -> int:
     result = library.repair_document(args.document)
     if not result["pages_changed"]:
@@ -327,6 +361,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pages", nargs="*", type=int)
     p.add_argument("--engine")
     p.set_defaults(func=cmd_reprocess)
+
+    p = sub.add_parser("image", help="render a page or one block as a JPEG")
+    p.add_argument("document")
+    p.add_argument("page", type=int)
+    p.add_argument("-b", "--block", type=int, help="crop to this block")
+    p.add_argument("-o", "--output", type=Path)
+    p.add_argument("--max-tokens", type=int, default=900,
+                   help="approximate token budget for the image")
+    p.set_defaults(func=cmd_image)
+
+    p = sub.add_parser("blocks", help="list the laid-out regions of a page")
+    p.add_argument("document")
+    p.add_argument("page", type=int)
+    p.set_defaults(func=cmd_blocks)
 
     p = sub.add_parser(
         "repair",

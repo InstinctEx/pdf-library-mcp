@@ -67,24 +67,60 @@ def test_exception_line_is_preferred_over_trailing_noise() -> None:
     assert _explain(output) == "ValueError: bad page range"
 
 
-def test_page_separator_splitting() -> None:
-    engine = MarkerEngine()
-    markdown = (
-        "{0}------------------------------------\n"
-        "First page body.\n"
-        "{1}------------------------------------\n"
-        "Second page body.\n"
-    )
-    pages = engine._split_pages(markdown, requested=None)
-    assert [p.page_number for p in pages] == [1, 2]
-    assert pages[0].markdown == "First page body."
+def test_json_output_is_parsed_into_blocks() -> None:
+    """The adapter reads Marker's JSON, not its Markdown renderer."""
+    from pdf_library.blocks import page_methods_from_meta, parse_document
+
+    document = {
+        "children": [
+            {
+                "id": "/page/119/Page/1",
+                "block_type": "Page",
+                "bbox": [0, 0, 596, 842],
+                "children": [
+                    {
+                        "id": "/page/119/Text/2",
+                        "block_type": "Text",
+                        "bbox": [10, 20, 300, 60],
+                        "html": "<p>Let <math>f(x) = x</math> be given.</p>",
+                    },
+                    {
+                        "id": "/page/119/Equation/3",
+                        "block_type": "Equation",
+                        "bbox": [10, 70, 500, 200],
+                        "html": '<p><math display="block">\\int f = 1</math></p>',
+                    },
+                ],
+            }
+        ]
+    }
+    meta = {"page_stats": [{"page_id": 119, "text_extraction_method": "surya"}]}
+
+    pages = parse_document(document, page_methods_from_meta(meta))
+    assert len(pages) == 1
+    page = pages[0]
+    assert page.page_number == 120  # Marker counts from zero
+    assert page.ocr_used
+    assert [b.block_type for b in page.blocks] == ["Text", "Equation"]
+    assert page.blocks[1].bbox == (10.0, 70.0, 500.0, 200.0)
+    assert "$$" in page.markdown
+    assert "$f(x) = x$" in page.markdown
 
 
-def test_split_pages_honours_requested_numbering() -> None:
-    engine = MarkerEngine()
-    markdown = (
-        "{0}------------------------------------\n"
-        "Body of page one hundred and twenty.\n"
-    )
-    pages = engine._split_pages(markdown, requested=[120])
-    assert [p.page_number for p in pages] == [120]
+def test_native_text_pages_are_not_marked_as_ocr() -> None:
+    from pdf_library.blocks import page_methods_from_meta, parse_document
+
+    document = {
+        "children": [
+            {
+                "id": "/page/0/Page/1",
+                "block_type": "Page",
+                "bbox": [0, 0, 596, 842],
+                "children": [
+                    {"block_type": "Text", "bbox": [0, 0, 1, 1], "html": "<p>hi</p>"}
+                ],
+            }
+        ]
+    }
+    meta = {"page_stats": [{"page_id": 0, "text_extraction_method": "pdftext"}]}
+    assert not parse_document(document, page_methods_from_meta(meta))[0].ocr_used

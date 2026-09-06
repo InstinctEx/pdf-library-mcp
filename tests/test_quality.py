@@ -82,3 +82,19 @@ def test_slides_without_tex_math_are_not_flagged(library: Library) -> None:
 
     inspection = PyMuPDFEngine().inspect(Path("tests/fixtures/scanned.pdf"))
     assert not any(page.math_fonts for page in inspection.pages)
+
+
+def test_language_is_judged_on_prose_not_latex() -> None:
+    """LaTeX is written in Latin letters and must not outvote the prose."""
+    from pdf_library.engines.base import ExtractedPage, ExtractionResult
+
+    def result(text: str) -> ExtractionResult:
+        return ExtractionResult("x", "1", [ExtractedPage(1, text)])
+
+    greek = (
+        r"Εφαρμόζουμε $\operatorname{συν}x$ και $$\int \frac{x}{2}\,dx$$ "
+        r"στην παράγουσα συνάρτηση παρακάτω."
+    )
+    assert Library._is_greek(result(greek))
+    assert not Library._is_greek(result("The dominated convergence theorem."))
+    assert not Library._is_greek(result(""))

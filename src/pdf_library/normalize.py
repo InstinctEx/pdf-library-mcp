@@ -65,6 +65,29 @@ def normalize_for_index(markdown: str) -> str:
     return _WHITESPACE.sub(" ", text).strip()
 
 
+# Words shorter than this carry too little signal to be worth fuzzy matching.
+_FUZZY_MIN_WORD = 4
+_WORD = re.compile(r"\w+", re.UNICODE)
+
+
+def trigrams(text: str) -> str:
+    """Character trigrams of every long word, as space-separated tokens.
+
+    This is the fallback index. OCR of handwriting produces errors that no
+    stemmer or accent rule can undo -- "παραγοντική" read as "παραχουτική"
+    differs in two places at once. Trigrams still share most of their pieces,
+    so a query that matches nothing exactly can still be ranked against them.
+    Deriving the trigrams from the already-stemmed text keeps the two indexes
+    describing the same words.
+    """
+    out: list[str] = []
+    for word in _WORD.findall(text):
+        if len(word) < _FUZZY_MIN_WORD:
+            continue
+        out.extend(word[i : i + 3] for i in range(len(word) - 2))
+    return " ".join(out)
+
+
 def normalize_query(query: str) -> str:
     """Apply the same folding to a user query, preserving FTS5 operators."""
     quoted = query.count('"') >= 2

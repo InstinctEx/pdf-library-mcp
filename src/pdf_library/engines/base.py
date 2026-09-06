@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
+from ..blocks import Block
+
 
 @dataclass
 class PageInspection:
@@ -42,6 +44,11 @@ class ExtractedPage:
     markdown: str
     ocr_used: bool = False
     ocr_reason: str | None = None
+    # Laid-out regions, when the engine reports them. Used for reliable chunk
+    # typing and for cropping the original of a single equation.
+    blocks: list["Block"] = field(default_factory=list)
+    page_width: float = 0.0
+    page_height: float = 0.0
 
 
 @dataclass

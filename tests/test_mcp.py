@@ -42,6 +42,7 @@ def test_tools_are_registered(server: Config) -> None:
         "get_pages",
         "get_chunk",
         "get_section",
+        "get_page_image",
         "list_documents",
         "document_status",
         "reprocess",
@@ -152,3 +153,40 @@ def test_response_budget_is_enforced(
     output = call("get_pages", {"document": document_id, "pages": [1, 2]})
     assert "truncated" in output
     assert estimate_tokens(output) < 200
+
+
+def test_page_image_is_returned_with_a_cost_caption(imported: str) -> None:
+    """The caption must state the cost, so the choice to spend it is informed."""
+    result = asyncio.run(
+        mcp_server.server.call_tool(
+            "get_page_image", {"document": imported, "page": 1, "max_tokens": 300}
+        )
+    )
+    blocks = result.content if hasattr(result, "content") else result[0]
+    kinds = [b.type for b in blocks]
+    assert "image" in kinds
+    caption = next(b.text for b in blocks if b.type == "text")
+    assert "tokens" in caption
+    assert "page 1" in caption
+
+
+def test_page_image_budget_is_capped(imported: str, server: Config) -> None:
+    """A caller cannot ask for an unbounded image."""
+    result = asyncio.run(
+        mcp_server.server.call_tool(
+            "get_page_image", {"document": imported, "page": 1, "max_tokens": 999999}
+        )
+    )
+    blocks = result.content if hasattr(result, "content") else result[0]
+    caption = next(b.text for b in blocks if b.type == "text")
+    reported = int(caption.split("about ")[1].split(" ")[0])
+    ceiling = server.response.max_image_tokens * 2
+    assert reported <= ceiling * 1.1
+
+
+def test_approximate_search_says_so(server: Config, math_pdf: Path) -> None:
+    with Library(server) as library:
+        library.import_pdf(math_pdf)
+    # A misspelling that only the trigram index can reach.
+    output = call("search_library", {"query": "convrgence"})
+    assert "approximate" in output or "No matches" in output

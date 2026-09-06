@@ -395,6 +395,10 @@ thing work well:
 
 ---
 
+## Where this is going
+
+`docs/NEXT.md` carries the agreed next steps and the decisions behind them.
+
 ## Licence
 
 This project's own source is MIT — see `LICENSE`, which also documents the

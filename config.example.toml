@@ -1,0 +1,41 @@
+# Copy to <library root>/config.toml, or point $PDF_LIBRARY_CONFIG at it.
+# Every value below is the built-in default.
+
+[library]
+root = "~/Documents/pdf-library"
+
+[extraction]
+# Always runs on import. Fast, local, no models.
+fast_engine = "pymupdf4llm"
+# Runs only when you ask for it. Produces real LaTeX. Set to "" to disable.
+quality_engine = "marker"
+# Pages scoring below this are offered for upgrade.
+upgrade_below_score = 0.75
+# Offer every page holding mathematics, not only the low-scoring ones.
+upgrade_math_pages = true
+# Upgrade automatically after import. Off by default: it is slow.
+auto_upgrade = false
+# Cap pages sent to the quality engine per job. 0 means no cap.
+max_upgrade_pages = 0
+
+[marker]
+executable = "marker_single"
+# "", "mps", "cuda" or "cpu". Empty lets marker decide.
+torch_device = ""
+timeout_seconds = 3600
+extra_args = []
+
+[search]
+max_results = 10
+snippet_chars = 320
+
+# Ceilings that keep MCP replies out of your context budget.
+[response]
+max_search_results = 10
+max_snippet_chars = 320
+max_page_chars = 12000
+max_response_tokens = 6000
+
+[chunking]
+target_chars = 1800
+max_chars = 4000

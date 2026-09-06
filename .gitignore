@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local machine configuration
+.claude/settings.local.json
+
+# The library itself: processed documents, database, extracted text
+library/
+pdf-library/
+
+# Proofreading pages embed the source document as images
+*-proofread.html
+proofread.html

@@ -1,0 +1,36 @@
+MIT License
+
+Copyright (c) 2026 pdf-library-mcp contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+NOTE ON DEPENDENCIES
+
+This project's own source is MIT. The extraction engines it drives are not:
+
+  - PyMuPDF and pymupdf4llm are AGPL-3.0 (Artifex also sells a commercial
+    licence). They are imported directly and are a required dependency.
+  - Marker (marker-pdf) is GPL-3.0 with an additional commercial-use
+    condition from its authors. It is an optional dependency and is invoked
+    as a subprocess, never imported.
+
+If you plan to distribute a derived work, check the current terms of those
+projects yourself rather than relying on this note.

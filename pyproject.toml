@@ -1,0 +1,24 @@
+[project]
+name = "pdf-library-mcp"
+version = "0.1.0"
+description = "Persistent local mathematical PDF library with MCP access"
+requires-python = ">=3.11"
+dependencies = [
+    "pymupdf4llm>=0.0.17",
+    "pymupdf>=1.26",
+    "mcp>=1.2",
+]
+
+[project.optional-dependencies]
+marker = ["marker-pdf>=1.0"]
+
+[project.scripts]
+pdf-library = "pdf_library.cli:main"
+pdf-library-mcp = "pdf_library.mcp_server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

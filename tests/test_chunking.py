@@ -77,3 +77,39 @@ def test_a_new_marker_starts_a_new_chunk() -> None:
     chunks = chunk_pages({1: page}, target_chars=10_000, max_chars=20_000)
     assert [c.heading for c in chunks] == ["Παράδειγμα", "Λύση", "Άσκηση"]
     assert [c.chunk_type for c in chunks] == ["example", "solution", "exercise"]
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("Λύψ Εκουμε δυο δυναρτήσεις", "Λύψ"),          # Λύση
+        ("Λύδη Έχουμε δύο", "Λύδη"),                     # Λύση
+        ("Εφαρμόχή Να υπολοχίσετε το", "Εφαρμόχή"),      # Εφαρμογή
+        ("Παράδειχμα: Να υπολογίσετε", "Παράδειχμα"),    # Παράδειγμα
+        ("Περίπτωση I Αν έχουμε", "Περίπτωση 1"),        # OCR reads 1 as I
+    ],
+)
+def test_ocr_damaged_markers_are_still_recognised(line: str, expected: str) -> None:
+    assert section_marker(line) == expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Εφαρμόζουμε παραγοντική ολοκλήρωση",  # verb built on the same root
+        "Παρατηρούμε ότι η σειρά συγκλίνει",
+        "Θεωρούμε την συνάρτηση f",
+        "Λύνουμε την εξίσωση ως προς x",
+        "εφαρμογή της μεθόδου στη συνέχεια",   # lowercase: mid-sentence
+    ],
+)
+def test_verbs_and_lowercase_are_not_promoted(line: str) -> None:
+    assert section_marker(line) is None
+
+
+@pytest.mark.parametrize(
+    ("heading", "expected"),
+    [("Λύψ", "solution"), ("Λύδη", "solution"), ("Εφαρμόχή", "application")],
+)
+def test_damaged_headings_are_still_typed(heading: str, expected: str) -> None:
+    assert classify(heading, "body") == expected

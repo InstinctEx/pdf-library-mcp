@@ -29,6 +29,7 @@ from .normalize import normalize_for_index, normalize_query, trigrams
 from .quality import assess_page, looks_mathematical
 from .rendering import RenderedRegion, render_region
 from .storage import DocumentStore
+from .textfix import rejoin_hyphenation
 from .tokens import estimate_tokens
 
 ProgressFn = Callable[[float, str], None]
@@ -364,6 +365,13 @@ class Library:
         total = max(len(result.pages), 1)
 
         for index, page in enumerate(result.pages, start=1):
+            # Hyphenation repair is language-independent and purely mechanical,
+            # so it always runs.
+            joined = rejoin_hyphenation(page.markdown)
+            page.markdown = joined.text
+            for key, value in joined.counts.items():
+                repairs[key] = repairs.get(key, 0) + value
+
             if repair_math:
                 report = repair_greek_math(page.markdown, allow_cosine=True)
                 page.markdown = report.text
@@ -569,20 +577,17 @@ class Library:
             raise LibraryError(f"{row['filename']} has no extracted pages")
 
         whole = "".join(pages.values())
-        if not looks_greek_mathematical(whole):
-            return {
-                "document_id": row["id"],
-                "pages_changed": 0,
-                "counts": {},
-                "detail": "no Greek mathematical notation found",
-            }
+        greek_math = looks_greek_mathematical(whole)
 
         counts: dict[str, int] = {}
         changed: list[int] = []
         for number, markdown in pages.items():
-            report = repair_greek_math(markdown, allow_cosine=True)
+            joined = rejoin_hyphenation(markdown)
+            report = repair_greek_math(joined.text, allow_cosine=greek_math)
             if report.text == markdown:
                 continue
+            for key, value in joined.counts.items():
+                counts[key] = counts.get(key, 0) + value
             store.write_page(number, report.text)
             changed.append(number)
             for key, value in report.counts.items():

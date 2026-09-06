@@ -145,7 +145,31 @@ deterministically — inside math spans only, so ordinary words like *ημέρα
 using that notation, and `pdf-library repair` applies it to documents already on
 disk without re-running OCR.
 
-### 5. Lecture notes have structure, just not Markdown structure
+### 5. The errors worth fixing are the ones that change the meaning
+
+Reading three OCR'd pages against their originals turned up four kinds of
+mis-parse, and they do not all deserve the same treatment.
+
+Two are mechanical and are repaired outright. Words broken across a line come
+back either split (`παραγο-` / `-ντική`) or already joined with the tail
+emitted a second time (`ολοκλήρωμα` / `- ρωμα`), and the two shapes need
+opposite handling. And the Greek article η is a single letter, so OCR reads it
+as a Latin `h` and, because it stands alone, files it as a mathematical
+variable: `η δυσκολία` becomes `$h$ δυσκολία`.
+
+One is only reported, deliberately. An underbrace annotation — a term with
+`f(x)` and `g'(x)` written underneath — is extracted as a *fraction* over those
+labels. The output is valid LaTeX that means something else entirely, and no
+check on the text alone can see it. But `\frac{g'(x)}{g(x)}` is also a perfectly
+ordinary logarithmic derivative, so removing it automatically would break real
+mathematics. Pages are flagged `underbrace_as_fraction` instead, and the reader
+is pointed at the image.
+
+The fourth is not fixable and is not pretended otherwise: OCR of handwritten
+Greek confuses γ with χ, η with υ, σ with δ. That is what the trigram index and
+the image are for.
+
+### 6. Lecture notes have structure, just not Markdown structure
 
 Handwritten notes contain no headings, so size-based chunking produced a dozen
 untitled fragments. But the structure is there in the words: *Παράδειγμα*,
@@ -153,6 +177,13 @@ untitled fragments. But the structure is there in the words: *Παράδειγμ
 folded stems and become both the chunk heading and its type, which makes
 `search --type solution` and `get_section` work on material that has no
 headings at all.
+
+OCR damages those words too — *Λύση* arrives as *Λύψ*, *Εφαρμογή* as
+*Εφαρμόχή* — and an exact match loses the heading on exactly the pages that
+need one most, so near-matches are accepted. That tolerance has to be paid for:
+it would otherwise promote *Εφαρμόζουμε*, the verb built on the same root as
+the heading *Εφαρμογή*. Two guards keep it honest — a marker must begin with a
+capital, and must not end in a verb ending.
 
 ---
 

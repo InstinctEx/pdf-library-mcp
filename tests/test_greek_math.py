@@ -122,3 +122,25 @@ def test_repair_is_idempotent(library: Library, tmp_path: Path) -> None:
     once = store.read_page(1)
     assert library.repair_document(result.document_id)["pages_changed"] == 0
     assert store.read_page(1) == once
+
+
+def test_article_read_as_a_variable_is_restored() -> None:
+    """The Greek article η is one letter, so OCR files it as a variable."""
+    result = repair("η δυσκολία: $h$ οποία έχει παράγουσα", allow_cosine=True)
+    assert "$h$" not in result.text
+    assert "η οποία" in result.text
+    assert result.counts["article_as_variable"] == 1
+
+
+def test_a_real_function_is_not_touched() -> None:
+    source = "η $h(x)$ είναι θετική παντού"
+    assert repair(source, allow_cosine=True).text == source
+
+
+def test_a_variable_before_a_short_word_is_not_touched() -> None:
+    source = "έστω $h$ μια συνάρτηση"
+    assert repair(source, allow_cosine=True).text == source
+
+
+def test_article_repair_is_gated_like_the_rest() -> None:
+    assert "$h$" in repair("let $h$ denote something", allow_cosine=False).text

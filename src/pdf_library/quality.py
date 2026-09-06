@@ -17,6 +17,21 @@ _GARBLED = re.compile(r"[�-]")
 _LETTERS = re.compile(r"[^\W\d_]", re.UNICODE)
 _LATEX_COMMAND = re.compile(r"\\[a-zA-Z]+")
 
+# A function label as it is written under a term: f(x), g(x), g'(x), h(x).
+_LABEL = r"[a-zA-Zφψ]'?\(x\)"
+# Underbrace annotations are the one error that produces valid LaTeX meaning
+# something else entirely: "x·cos(2x) with f(x) and g'(x) written underneath"
+# is extracted as a fraction over those labels. Two or more labels multiplied
+# together in a denominator is the signature -- dividing by f(x)·g'(x) is a
+# thing almost no text actually does.
+_LABEL_DENOMINATOR = re.compile(
+    r"\\frac\{[^{}]*\}\{\s*" + _LABEL + r"(?:\s*\\cdot\s*" + _LABEL + r")+\s*\}"
+)
+# The weaker shape: a denominator that is nothing but one label.
+_SINGLE_LABEL_DENOMINATOR = re.compile(
+    r"\\frac\{[^{}]*\}\{\s*" + _LABEL + r"\s*\}"
+)
+
 
 @dataclass
 class PageQuality:
@@ -96,6 +111,15 @@ def assess_page(markdown: str) -> PageQuality:
     if stray > 2:
         issues.append(f"latex_outside_math:{stray}")
         score -= min(0.3, stray * 0.05)
+
+    # Underbrace annotations misread as fractions. Once one is confirmed on a
+    # page, the ambiguous single-label ones on the same page are the same
+    # artefact, so they are counted too.
+    confirmed = len(_LABEL_DENOMINATOR.findall(markdown))
+    if confirmed:
+        total = confirmed + len(_SINGLE_LABEL_DENOMINATOR.findall(markdown))
+        issues.append(f"underbrace_as_fraction:{total}")
+        score -= min(0.45, 0.15 * total)
 
     score = max(0.0, min(1.0, score))
     if score >= 0.75:

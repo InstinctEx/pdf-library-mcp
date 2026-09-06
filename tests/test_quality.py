@@ -98,3 +98,41 @@ def test_language_is_judged_on_prose_not_latex() -> None:
     assert Library._is_greek(result(greek))
     assert not Library._is_greek(result("The dominated convergence theorem."))
     assert not Library._is_greek(result(""))
+
+
+def test_underbrace_read_as_a_fraction_is_flagged() -> None:
+    """Valid LaTeX that means something else: the one error output cannot show.
+
+    ``x·cos(2x)`` with ``f(x)`` and ``g'(x)`` written underneath is extracted
+    as a fraction over those labels.
+    """
+    page = (
+        r"$$\int \frac{x \cdot \cos(2x)}{f(x) \cdot g'(x)} dx"
+        r" = \frac{x \cdot \sin(2x)}{f(x) \cdot g(x)}$$"
+    )
+    quality = assess_page(page)
+    assert any(i.startswith("underbrace_as_fraction") for i in quality.issues)
+    assert quality.state != "good"
+
+
+def test_a_genuine_logarithmic_derivative_is_not_flagged() -> None:
+    page = (
+        "Integrating the logarithmic derivative gives a logarithm, since for "
+        "any differentiable and non-vanishing function the following holds:\n\n"
+        r"$$\int \frac{g'(x)}{g(x)}\,dx = \ln|g(x)| + C$$"
+    )
+    assert not any(
+        i.startswith("underbrace_as_fraction") for i in assess_page(page).issues
+    )
+
+
+def test_the_quotient_rule_is_not_flagged() -> None:
+    page = (
+        "The quotient rule for differentiable functions states the following "
+        "identity, valid wherever the denominator does not vanish:\n\n"
+        r"$$\left(\frac{f(x)}{g(x)}\right)'"
+        r" = \frac{f'(x)g(x) - f(x)g'(x)}{g(x)^2}$$"
+    )
+    assert not any(
+        i.startswith("underbrace_as_fraction") for i in assess_page(page).issues
+    )

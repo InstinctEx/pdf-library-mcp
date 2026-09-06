@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from .normalize import fold
 from .quality import count_math
@@ -30,12 +31,28 @@ _SECTION_WORDS: tuple[str, ...] = (
     "example", "exercise", "solution", "theorem", "definition", "proof",
     "lemma", "corollary", "remark", "proposition", "method", "step", "case",
 )
+# OCR of handwriting damages these words too -- "Λύση" arrives as "Λύψ",
+# "Εφαρμογή" as "Εφαρμόχή" -- and an exact stem match then loses the heading
+# on exactly the pages that need one most. The candidate set is tiny and
+# closed, so a similarity test against it is safe where a general spelling
+# correction would not be.
+_MARKER_SIMILARITY = 0.75
+
+# Section markers are nouns. Allowing near-matches lets the verbs built on the
+# same root in ("Εφαρμογή" the heading, "εφαρμόζουμε" the sentence), so verb
+# endings are rejected outright.
+_VERB_ENDINGS = (
+    "ουμε", "ουμαι", "εται", "ονται", "ονταν", "ετε", "ουν", "αμε", "ατε",
+    "ειται", "ηκε", "θηκε", "ζουμε", "σουμε",
+)
+
 # The marker word, an optional number ("Περίπτωση 2", "Θεώρημα 2.5"), then a
-# separator or the end of the line.
+# separator or the end of the line. A lone Latin "I" is accepted as the
+# numeral 1, which is how OCR renders it.
 _SECTION_MARKER = re.compile(
     r"^\s{0,3}[*_>#\s]{0,4}"
     r"(?P<word>[^\W\d_]{3,20})"
-    r"(?P<number>\s+\d+(?:\.\d+)*)?"
+    r"(?P<number>\s+(?:\d+(?:\.\d+)*|[IΙ]))?"
     r"\s*(?P<sep>[:.\u0387)\]]|\s|$)"
 )
 _FENCE = re.compile(r"^\s*(```|~~~)")
@@ -88,9 +105,11 @@ def classify(heading: str | None, body: str) -> str:
     get a say.
     """
     if heading:
-        folded = fold(heading)
+        # The heading may itself be OCR-damaged -- "Λύψ" for "Λύση" -- so the
+        # same tolerance that recognised it as a heading applies to typing it.
+        folded = fold(heading.split()[0]) if heading.split() else ""
         for label, stems in _TYPE_STEMS:
-            if any(folded.startswith(stem) for stem in stems):
+            if any(_resembles(folded, stem) for stem in stems):
                 return label
 
     probe = fold(f"{heading or ''}\n{body[:160]}")
@@ -117,11 +136,40 @@ def section_marker(line: str) -> str | None:
     if not match:
         return None
     word = match.group("word")
-    folded = fold(word)
-    if not any(folded.startswith(root) for root in _SECTION_WORDS):
+    # A heading opens with a capital. Requiring one costs nothing here and
+    # keeps mid-sentence words from being promoted.
+    if not word[:1].isupper():
+        return None
+    if not _matches_section_word(fold(word)):
         return None
     number = (match.group("number") or "").strip()
+    if number in ("I", "Ι"):
+        number = "1"
     return f"{word} {number}".strip()
+
+
+def _resembles(folded: str, root: str) -> bool:
+    """Whether a folded word starts with a root, allowing for OCR damage."""
+    if folded.startswith(root):
+        return True
+    if len(folded) < 3 or folded.endswith(_VERB_ENDINGS):
+        return False
+    # Compare only the stem's worth of characters, since the word carries an
+    # inflectional ending the root does not.
+    candidate = folded[: max(len(root), 3)]
+    if len(root) <= 4:
+        # A ratio is too blunt for a three-letter stem: one substitution
+        # already drops it to 0.67. Count the substitutions instead, and allow
+        # exactly one ("λυψ" for "λυσ").
+        return len(candidate) == len(root) and sum(
+            a != b for a, b in zip(candidate, root)
+        ) <= 1
+    return SequenceMatcher(None, candidate, root).ratio() >= _MARKER_SIMILARITY
+
+
+def _matches_section_word(folded: str) -> bool:
+    """Whether a folded word is one of the section words, OCR damage allowed."""
+    return any(_resembles(folded, root) for root in _SECTION_WORDS)
 
 
 @dataclass

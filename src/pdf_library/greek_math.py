@@ -68,6 +68,16 @@ _COMMAND_RUN = re.compile(
 
 _ALREADY_WRAPPED = re.compile(r"\\(?:operatorname|mathrm|text)\{[^}]*\}")
 
+# The Greek article η is a single letter, and OCR reads it as a Latin h or n
+# and then, because it stands alone, files it as a mathematical variable:
+# "η δυσκολία" becomes "$h$ δυσκολία". A bare one-letter math span followed by
+# an ordinary Greek word is the article, not a variable -- a real variable in
+# this position would be applied to something, as h(x) or h_1.
+_GREEK_LOWER = "α-ωάέήίόύώϊϋΐΰ"
+_ARTICLE_AS_VARIABLE = re.compile(
+    r"(?<![\\\w])\$\s*h\s*\$(?=\s+[" + _GREEK_LOWER + r"]{4,})"
+)
+
 
 @dataclass
 class RepairReport:
@@ -151,6 +161,11 @@ def _repair_fragment(fragment: str, allow_cosine: bool) -> tuple[str, dict[str, 
     return fragment, counts
 
 
+def repair_article(markdown: str) -> tuple[str, int]:
+    """Turn a lone ``$h$`` back into the Greek article it was."""
+    return _ARTICLE_AS_VARIABLE.subn("η", markdown)
+
+
 def repair(markdown: str, allow_cosine: bool | None = None) -> RepairReport:
     """Repair Greek function names inside the math spans of one page.
 
@@ -171,4 +186,10 @@ def repair(markdown: str, allow_cosine: bool | None = None) -> RepairReport:
 
     text = _DISPLAY_MATH.sub(lambda m: repl(m, "$$"), markdown)
     text = _INLINE_MATH.sub(lambda m: repl(m, "$"), text)
+
+    if allow_cosine:
+        text, articles = repair_article(text)
+        if articles:
+            counts["article_as_variable"] = articles
+
     return RepairReport(text=text, counts=counts)

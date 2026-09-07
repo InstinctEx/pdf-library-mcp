@@ -72,6 +72,25 @@ class ChunkingConfig:
 
 
 @dataclass(frozen=True)
+class RepairConfig:
+    """Optional local resources used by deterministic text repair."""
+
+    # A plain UTF-8 Greek wordlist. Empty keeps prose correction disabled.
+    greek_lexicon: str = ""
+    # Hunspell dictionary stem, without .aff/.dic. An empty value discovers
+    # <library root>/dictionaries/Greek when it has been installed locally.
+    greek_hunspell: str = ""
+
+
+@dataclass(frozen=True)
+class SafetyConfig:
+    """Optional local resource ceilings for untrusted PDF inputs."""
+
+    max_pdf_bytes: int = 0
+    max_pdf_pages: int = 0
+
+
+@dataclass(frozen=True)
 class Config:
     root: Path = DEFAULT_ROOT
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
@@ -79,6 +98,8 @@ class Config:
     search: SearchConfig = field(default_factory=SearchConfig)
     response: ResponseConfig = field(default_factory=ResponseConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
+    repair: RepairConfig = field(default_factory=RepairConfig)
+    safety: SafetyConfig = field(default_factory=SafetyConfig)
 
     @property
     def documents_dir(self) -> Path:
@@ -126,4 +147,6 @@ def load_config(path: Path | None = None) -> Config:
         search=_apply(SearchConfig(), _section(data, "search")),
         response=_apply(ResponseConfig(), _section(data, "response")),
         chunking=_apply(ChunkingConfig(), _section(data, "chunking")),
+        repair=_apply(RepairConfig(), _section(data, "repair")),
+        safety=_apply(SafetyConfig(), _section(data, "safety")),
     )

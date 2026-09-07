@@ -211,6 +211,17 @@ Images are never returned by any other tool, never automatically, and the
 render scale is derived from a token budget rather than a DPI, so asking for
 "about 400 tokens" gets the largest image that fits.
 
+### Visual OCR review
+
+For scan-derived pages, the library now keeps a separate visual-review queue.
+A vision-capable AI calls `ocr_review_queue`, then `review_ocr_page` for one
+page. The latter returns the original page image and saved Markdown together,
+so the AI can compare symbols, numbers, formulas and prose before recording
+`approved`, `needs_correction`, or `unreadable` through
+`record_ocr_review`. A verdict is an audit record only: it cannot silently
+rewrite the document. Any new extraction that changes a scanned page returns
+that page to the review queue.
+
 ## On speed
 
 Both tiers are bounded by third-party model inference, and the rest was
@@ -247,6 +258,28 @@ brew install llama.cpp
 
 The first Marker run downloads several GB of models before it does any work.
 
+### Optional deterministic Greek prose repair
+
+`pdf-library repair` can also correct known handwritten-OCR substitutions in
+ordinary Greek prose. For the full inflection-aware mode, install `spylls` and
+put `Greek.aff` plus `Greek.dic` at `<library root>/dictionaries/Greek.*`.
+Point `greek_hunspell` elsewhere only when you need a custom location. A plain
+UTF-8 wordlist remains available as a smaller fallback:
+
+```bash
+.venv/bin/pip install -e '.[spellcheck]'
+```
+
+```toml
+[repair]
+greek_lexicon = "/absolute/path/to/greek-words.txt"
+greek_hunspell = "/absolute/path/to/Greek"
+```
+
+It changes a word only when exactly one word in that list is reachable through
+the documented Greek handwriting confusions; it never changes text inside math
+delimiters. Every accepted correction is printed as an audit entry.
+
 ---
 
 ## Command line
@@ -279,6 +312,9 @@ way to judge extraction quality is to look at it.
 claude mcp add pdf-library -- /absolute/path/to/.venv/bin/pdf-library-mcp
 ```
 
+`import_pdf` and `reprocess` return a job id. Poll `job_status(job_id)` until
+it returns the document id, then use `document_status` for the quality report.
+
 For Claude Desktop, in `claude_desktop_config.json`:
 
 ```json
@@ -304,6 +340,9 @@ For Claude Desktop, in `claude_desktop_config.json`:
 | `list_documents` | The library, metadata only |
 | `document_status` | Progress, quality report, pages worth upgrading |
 | `get_page_image` | The original page, or one cropped block, as an image. Opt-in and priced |
+| `ocr_review_queue` | Scan/OCR pages that need image-to-text verification |
+| `review_ocr_page` | One original page image alongside its saved transcription |
+| `record_ocr_review` | Persist an approved, needs-correction, or unreadable verdict |
 | `reprocess` | Re-extracts named pages with Marker |
 
 Imports never block the transport: `import_pdf` returns a job id and
@@ -387,9 +426,9 @@ thing work well:
   belongs on the handful of pages that fail it, opt-in, never on all of them.
 - A third extraction engine. Two tiers cover the range; a third is weight
   without a measured gain.
-- A spelling dictionary for OCR'd Greek prose. One wrong "correction" in a
-  mathematical text is worse than visible nonsense; the trigram index and the
-  image escape hatch solve the same problem without that risk.
+- A bundled third-party spelling dictionary for OCR'd Greek prose. The optional
+  local-wordlist repair is deliberately constrained to one auditable candidate;
+  a broad dictionary will not be bundled without a separate licence review.
 - Anything server-shaped: no Postgres, no queue, no web frontend. It is a local
   tool for one person's bookshelf.
 

@@ -42,3 +42,17 @@ max_image_tokens = 900
 [chunking]
 target_chars = 1800
 max_chars = 4000
+
+[repair]
+# Optional plain UTF-8 Greek wordlist for conservative OCR prose repair.
+# A word changes only when this file supplies one unique allowed candidate.
+greek_lexicon = ""
+# Full inflection-aware Hunspell dictionary. Leave empty to discover
+# <library root>/dictionaries/Greek.{aff,dic} automatically.
+greek_hunspell = ""
+
+[safety]
+# Zero means unlimited. Set these when the MCP server receives PDFs from
+# untrusted callers.
+max_pdf_bytes = 0
+max_pdf_pages = 0

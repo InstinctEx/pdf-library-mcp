@@ -43,8 +43,12 @@ def test_tools_are_registered(server: Config) -> None:
         "get_chunk",
         "get_section",
         "get_page_image",
+        "review_ocr_page",
+        "ocr_review_queue",
+        "record_ocr_review",
         "list_documents",
         "document_status",
+        "job_status",
         "reprocess",
     }
 
@@ -107,6 +111,25 @@ def test_document_status(imported: str) -> None:
     output = call("document_status", {"document": imported})
     assert "status: complete" in output
     assert "equations:" in output
+
+
+def test_job_status_reports_the_exact_job(server: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeRunner:
+        def job(self, job_id):
+            return {
+                "id": job_id,
+                "kind": "import",
+                "state": "running",
+                "progress": 0.5,
+                "detail": "extracting",
+                "document_id": None,
+                "error": None,
+            }
+
+    monkeypatch.setattr(mcp_server, "_runner", FakeRunner())
+    output = call("job_status", {"job_id": "abc123"})
+    assert "job abc123" in output
+    assert "progress: 50%" in output
 
 
 def test_reprocess_reports_a_missing_engine(imported: str) -> None:
@@ -182,6 +205,38 @@ def test_page_image_budget_is_capped(imported: str, server: Config) -> None:
     reported = int(caption.split("about ")[1].split(" ")[0])
     ceiling = server.response.max_image_tokens * 2
     assert reported <= ceiling * 1.1
+
+
+def test_ai_can_visually_review_and_record_an_ocr_page(
+    imported: str, server: Config
+) -> None:
+    """The review flow supplies both source pixels and transcript, then audits it."""
+    with Library(server) as library:
+        library.conn.execute(
+            "UPDATE pages SET source_scanned=1, verification_state='pending' "
+            "WHERE document_id=? AND page_number=1",
+            (imported,),
+        )
+
+    assert "p1 [pending" in call("ocr_review_queue", {"document": imported})
+    review = asyncio.run(
+        mcp_server.server.call_tool(
+            "review_ocr_page", {"document": imported, "page": 1, "max_tokens": 300}
+        )
+    )
+    blocks = review.content if hasattr(review, "content") else review[0]
+    assert any(block.type == "image" for block in blocks)
+    assert "Compare the image" in next(
+        block.text for block in blocks if block.type == "text"
+    )
+    recorded = call(
+        "record_ocr_review",
+        {"document": imported, "page": 1, "verdict": "approved"},
+    )
+    assert "Recorded OCR review" in recorded
+    assert "no pages need visual OCR review" in call(
+        "ocr_review_queue", {"document": imported}
+    )
 
 
 def test_approximate_search_says_so(server: Config, math_pdf: Path) -> None:

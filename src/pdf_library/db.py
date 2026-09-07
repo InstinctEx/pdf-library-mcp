@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 # Bumped whenever the text written into the FTS index changes shape, which
 # makes every existing index stale until the documents are reindexed.
 INDEX_VERSION = 3
@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS pages (
     ocr_used      INTEGER NOT NULL DEFAULT 0,
     ocr_reason    TEXT,
     needs_ocr     INTEGER NOT NULL DEFAULT 0,
+    source_scanned INTEGER NOT NULL DEFAULT 0,
+    -- A visual comparison of the source image and extracted Markdown.  This
+    -- is deliberately separate from `quality_state`: deterministic checks can
+    -- find malformed output, but only a reader with the page image can say it
+    -- matches the source.
+    verification_state TEXT NOT NULL DEFAULT 'not_needed',
+    verification_note  TEXT,
+    verified_at        TEXT,
     quality_score REAL,
     quality_state TEXT,
     quality_issues TEXT,
@@ -67,6 +75,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     page_end      INTEGER NOT NULL,
     ordinal       INTEGER NOT NULL,
     heading       TEXT,
+    raw_heading   TEXT,
     chunk_type    TEXT NOT NULL DEFAULT 'paragraph',
     content       TEXT NOT NULL,
     search_text   TEXT NOT NULL DEFAULT '',
@@ -188,6 +197,36 @@ def _migrate(conn: sqlite3.Connection) -> bool:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
     if "fuzzy" not in columns:
         conn.execute("ALTER TABLE chunks ADD COLUMN fuzzy TEXT NOT NULL DEFAULT ''")
+    if "raw_heading" not in columns:
+        conn.execute("ALTER TABLE chunks ADD COLUMN raw_heading TEXT")
+
+    page_columns = {row[1] for row in conn.execute("PRAGMA table_info(pages)")}
+    if "source_scanned" not in page_columns:
+        conn.execute(
+            "ALTER TABLE pages ADD COLUMN source_scanned INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "UPDATE pages SET source_scanned=1 WHERE document_id IN "
+            "(SELECT id FROM documents WHERE kind='scanned')"
+        )
+
+    # Existing scanned/OCR pages have never had an image-to-text comparison,
+    # so put them in the queue rather than implying approval.
+    page_columns = {row[1] for row in conn.execute("PRAGMA table_info(pages)")}
+    if "verification_state" not in page_columns:
+        conn.execute(
+            "ALTER TABLE pages ADD COLUMN verification_state TEXT "
+            "NOT NULL DEFAULT 'not_needed'"
+        )
+        conn.execute(
+            "UPDATE pages SET verification_state = CASE "
+            "WHEN source_scanned=1 OR ocr_used=1 THEN 'pending' "
+            "ELSE 'not_needed' END"
+        )
+    if "verification_note" not in page_columns:
+        conn.execute("ALTER TABLE pages ADD COLUMN verification_note TEXT")
+    if "verified_at" not in page_columns:
+        conn.execute("ALTER TABLE pages ADD COLUMN verified_at TEXT")
 
     fts_columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks_fts)")}
     if fts_columns and "fuzzy" not in fts_columns:
@@ -237,7 +276,7 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         rebuild_index(conn)
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
-        "ON CONFLICT(key) DO NOTHING",
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (str(SCHEMA_VERSION),),
     )
     # Only stamp the index version on a database that has nothing indexed yet.

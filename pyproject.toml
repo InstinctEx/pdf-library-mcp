@@ -11,6 +11,7 @@ dependencies = [
 
 [project.optional-dependencies]
 marker = ["marker-pdf>=1.0"]
+spellcheck = ["spylls>=0.1.7"]
 
 [project.scripts]
 pdf-library = "pdf_library.cli:main"

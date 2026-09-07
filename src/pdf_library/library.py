@@ -29,6 +29,7 @@ from .normalize import normalize_for_index, normalize_query, trigrams
 from .quality import assess_page, looks_mathematical
 from .rendering import RenderedRegion, render_region
 from .storage import DocumentStore
+from .spellfix import repair_greek_prose
 from .textfix import rejoin_hyphenation
 from .tokens import estimate_tokens
 
@@ -163,6 +164,11 @@ class Library:
             raise LibraryError(f"not a file: {pdf_path}")
         if pdf_path.suffix.lower() != ".pdf":
             raise LibraryError(f"not a PDF: {pdf_path.name}")
+        max_bytes = self.config.safety.max_pdf_bytes
+        if max_bytes and pdf_path.stat().st_size > max_bytes:
+            raise LibraryError(
+                f"PDF is {pdf_path.stat().st_size} bytes; limit is {max_bytes} bytes"
+            )
 
         started = time.perf_counter()
         progress(0.02, "hashing")
@@ -172,14 +178,21 @@ class Library:
         if existing is not None and not force and existing["status"] == "complete":
             return self._cache_hit_result(existing, time.perf_counter() - started)
 
+        engine = get_engine(self.config.extraction.fast_engine, self.config)
+        progress(0.08, "inspecting")
+        # Inspect the caller's file before copying it into the persistent
+        # store, so a page-limit rejection leaves no orphaned library data.
+        inspection = engine.inspect(pdf_path)
+        max_pages = self.config.safety.max_pdf_pages
+        if max_pages and inspection.page_count > max_pages:
+            raise LibraryError(
+                f"PDF has {inspection.page_count} pages; limit is {max_pages} pages"
+            )
+
         document_id = existing["id"] if existing else make_document_id(sha256)
         store = self.store(document_id)
         store.ensure()
         store.store_source(pdf_path)
-
-        engine = get_engine(self.config.extraction.fast_engine, self.config)
-        progress(0.08, "inspecting")
-        inspection = engine.inspect(store.source_pdf)
 
         title = inspection.title or pdf_path.stem
         self.conn.execute(
@@ -356,6 +369,12 @@ class Library:
         repair_math = greek_document and looks_greek_mathematical(
             "".join(page.markdown for page in result.pages)
         )
+        lexicon = (
+            Path(self.config.repair.greek_lexicon).expanduser()
+            if greek_document and self.config.repair.greek_lexicon
+            else None
+        )
+        hunspell = self._greek_hunspell_path() if greek_document else None
         repairs: dict[str, int] = {}
         math_pages: list[int] = []
         low_quality: list[int] = []
@@ -371,6 +390,12 @@ class Library:
             page.markdown = joined.text
             for key, value in joined.counts.items():
                 repairs[key] = repairs.get(key, 0) + value
+
+            if greek_document:
+                prose = repair_greek_prose(page.markdown, lexicon, hunspell)
+                page.markdown = prose.text
+                for key, value in prose.counts.items():
+                    repairs[key] = repairs.get(key, 0) + value
 
             if repair_math:
                 report = repair_greek_math(page.markdown, allow_cosine=True)
@@ -403,14 +428,32 @@ class Library:
                 """
                 INSERT INTO pages (
                     document_id, page_number, page_hash, char_count, engine,
-                    quality_tier, ocr_used, ocr_reason, needs_ocr, quality_score,
+                    quality_tier, ocr_used, ocr_reason, needs_ocr, source_scanned,
+                    verification_state,
+                    quality_score,
                     quality_state, quality_issues, math_count, table_count, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(document_id, page_number) DO UPDATE SET
                     page_hash=excluded.page_hash, char_count=excluded.char_count,
                     engine=excluded.engine, quality_tier=excluded.quality_tier,
                     ocr_used=excluded.ocr_used, ocr_reason=excluded.ocr_reason,
-                    needs_ocr=excluded.needs_ocr, quality_score=excluded.quality_score,
+                    needs_ocr=excluded.needs_ocr,
+                    source_scanned=excluded.source_scanned,
+                    verification_state=CASE
+                        WHEN pages.page_hash IS NOT excluded.page_hash
+                         AND (excluded.source_scanned=1 OR excluded.ocr_used=1)
+                        THEN 'pending'
+                        WHEN excluded.source_scanned=0 AND excluded.ocr_used=0
+                        THEN 'not_needed'
+                        ELSE pages.verification_state
+                    END,
+                    verification_note=CASE
+                        WHEN pages.page_hash IS NOT excluded.page_hash
+                        THEN NULL ELSE pages.verification_note END,
+                    verified_at=CASE
+                        WHEN pages.page_hash != excluded.page_hash
+                        THEN NULL ELSE pages.verified_at END,
+                    quality_score=excluded.quality_score,
                     quality_state=excluded.quality_state,
                     quality_issues=excluded.quality_issues,
                     math_count=excluded.math_count, table_count=excluded.table_count,
@@ -426,6 +469,8 @@ class Library:
                     int(page.ocr_used),
                     page.ocr_reason,
                     int(needs_ocr),
+                    int(is_scanned),
+                    "pending" if is_scanned or page.ocr_used else "not_needed",
                     quality.score,
                     quality.state,
                     json.dumps(quality.issues, ensure_ascii=False),
@@ -486,7 +531,7 @@ class Library:
 
     @staticmethod
     def _is_greek(result: ExtractionResult) -> bool:
-        """Decide the document's language from its prose, not its formulas.
+        r"""Decide the document's language from its prose, not its formulas.
 
         LaTeX is written in Latin letters -- ``\operatorname``, ``\int``,
         ``aligned`` -- and a mathematical page carries enough of it to drown
@@ -496,9 +541,27 @@ class Library:
         if not sample:
             return False
         prose = _MATH_SPAN.sub(" ", sample)
-        greek = sum(1 for ch in prose if "Ͱ" <= ch <= "Ͽ" or "ἀ" <= ch <= "῿")
-        letters = sum(1 for ch in prose if ch.isalpha())
+        return Library._text_is_greek(prose)
+
+    @staticmethod
+    def _text_is_greek(text: str) -> bool:
+        """Whether prose is predominately Greek after callers remove math."""
+        if not text:
+            return False
+        greek = sum(1 for ch in text if "Ͱ" <= ch <= "Ͽ" or "ἀ" <= ch <= "῿")
+        letters = sum(1 for ch in text if ch.isalpha())
         return letters > 0 and greek / letters > 0.3
+
+    def _greek_hunspell_path(self) -> Path | None:
+        """Locate the optional local Greek Hunspell dictionary."""
+        configured = self.config.repair.greek_hunspell
+        path = (
+            Path(configured).expanduser()
+            if configured
+            else self.config.root / "dictionaries" / "Greek"
+        )
+        stem = path.with_suffix("") if path.suffix in (".aff", ".dic") else path
+        return stem if stem.with_suffix(".aff").is_file() and stem.with_suffix(".dic").is_file() else None
 
     # ------------------------------------------------------------------
     # indexing
@@ -516,6 +579,7 @@ class Library:
             target_chars=self.config.chunking.target_chars,
             max_chars=self.config.chunking.max_chars,
         )
+        self._number_repeated_headings(chunks)
 
         try:
             self._write_chunks(document_id, chunks)
@@ -528,6 +592,25 @@ class Library:
             self._write_chunks(document_id, chunks)
         return len(chunks)
 
+    @staticmethod
+    def _number_repeated_headings(chunks: list[Chunk]) -> None:
+        """Give a run of equal headings useful, stable display labels."""
+        start = 0
+        while start < len(chunks):
+            raw = chunks[start].raw_heading or chunks[start].heading
+            end = start + 1
+            while end < len(chunks):
+                other = chunks[end].raw_heading or chunks[end].heading
+                if not raw or other != raw:
+                    break
+                end += 1
+            if raw and end - start > 1:
+                total = end - start
+                for number, chunk in enumerate(chunks[start:end], start=1):
+                    chunk.raw_heading = raw
+                    chunk.heading = f"{raw} ({number}/{total})"
+            start = end
+
     def _write_chunks(self, document_id: str, chunks: list[Chunk]) -> None:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
@@ -536,10 +619,10 @@ class Library:
             self.conn.executemany(
                 """
                 INSERT INTO chunks (
-                    document_id, page_start, page_end, ordinal, heading,
+                    document_id, page_start, page_end, ordinal, heading, raw_heading,
                     chunk_type, content, search_text, fuzzy, char_count,
                     token_estimate, math_count
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -548,6 +631,7 @@ class Library:
                         c.page_end,
                         c.ordinal,
                         c.heading,
+                        c.raw_heading,
                         c.chunk_type,
                         c.content,
                         search_text,
@@ -578,12 +662,27 @@ class Library:
 
         whole = "".join(pages.values())
         greek_math = looks_greek_mathematical(whole)
+        greek_document = row["language"] == "ell" or self._text_is_greek(whole)
+        lexicon = (
+            Path(self.config.repair.greek_lexicon).expanduser()
+            if self.config.repair.greek_lexicon
+            else None
+        )
+        hunspell = self._greek_hunspell_path()
 
         counts: dict[str, int] = {}
         changed: list[int] = []
+        changes: list[dict[str, Any]] = []
         for number, markdown in pages.items():
             joined = rejoin_hyphenation(markdown)
-            report = repair_greek_math(joined.text, allow_cosine=greek_math)
+            prose = (
+                repair_greek_prose(joined.text, lexicon, hunspell)
+                if greek_document
+                else None
+            )
+            report = repair_greek_math(
+                prose.text if prose else joined.text, allow_cosine=greek_math
+            )
             if report.text == markdown:
                 continue
             for key, value in joined.counts.items():
@@ -592,6 +691,17 @@ class Library:
             changed.append(number)
             for key, value in report.counts.items():
                 counts[key] = counts.get(key, 0) + value
+            if prose:
+                for change in prose.changes:
+                    changes.append(
+                        {
+                            "page": number,
+                            "original": change.original,
+                            "replacement": change.replacement,
+                        }
+                    )
+                for key, value in prose.counts.items():
+                    counts[key] = counts.get(key, 0) + value
 
             quality = assess_page(report.text)
             self.conn.execute(
@@ -621,6 +731,7 @@ class Library:
             "pages_changed": len(changed),
             "pages": changed,
             "counts": counts,
+            "changes": changes,
             "chunk_count": chunk_count,
         }
 
@@ -721,6 +832,24 @@ class Library:
         if row is None:
             raise LibraryError(f"no such document: {document_id}")
 
+        provided = list(pages) if pages is not None else []
+        if provided:
+            invalid = [
+                page
+                for page in provided
+                if not isinstance(page, int)
+                or isinstance(page, bool)
+                or page < 1
+                or page > row["page_count"]
+            ]
+            if invalid:
+                raise LibraryError(
+                    f"invalid page(s) {invalid}; valid range is 1-{row['page_count']}"
+                )
+        targets = sorted(set(provided)) if provided else self._upgrade_candidates(document_id)
+        if not targets:
+            return {"document_id": row["id"], "pages": [], "detail": "nothing to upgrade"}
+
         name = engine_name or self.config.extraction.quality_engine
         if not name:
             raise LibraryError("no quality engine configured")
@@ -729,16 +858,12 @@ class Library:
         if not ok:
             raise EngineUnavailable(reason)
 
-        targets = sorted(set(pages)) if pages else self._upgrade_candidates(document_id)
-        if not targets:
-            return {"document_id": row["id"], "pages": [], "detail": "nothing to upgrade"}
-
         store = self.store(row["id"])
         progress(0.05, f"{name}: {len(targets)} pages")
         result = engine.extract(store.source_pdf, pages=targets)
         self._record_run(row["id"], result, pages=targets)
 
-        scanned = set(self._pages_where("needs_ocr = 1", row["id"]))
+        scanned = set(self._pages_where("source_scanned = 1", row["id"]))
         stats = self._store_pages(
             document_id=row["id"],
             store=store,
@@ -921,6 +1046,101 @@ class Library:
             "page_count": row["page_count"],
         }
 
+    def ocr_review_queue(
+        self, document_ref: str, limit: int = 10
+    ) -> dict[str, Any]:
+        """Return pages that need image-to-text verification, highest risk first.
+
+        This is a queue for a vision-capable AI or a human reviewer, not a
+        second OCR pass.  The reviewer compares the source page to the saved
+        Markdown and records an explicit verdict with :meth:`record_ocr_review`.
+        """
+        row = self.resolve(document_ref)
+        limit = max(1, min(int(limit), 100))
+        rows = self.conn.execute(
+            """
+            SELECT page_number, source_scanned, ocr_used, quality_score,
+                   quality_state, quality_issues, math_count, verification_state
+              FROM pages
+             WHERE document_id = ?
+               AND verification_state IN ('pending', 'needs_correction', 'unreadable')
+             ORDER BY CASE verification_state
+                        WHEN 'needs_correction' THEN 0
+                        WHEN 'unreadable' THEN 1
+                        ELSE 2 END,
+                      quality_score ASC, math_count DESC, page_number ASC
+             LIMIT ?
+            """,
+            (row["id"], limit),
+        ).fetchall()
+        pages = []
+        for item in rows:
+            reasons: list[str] = []
+            if item["source_scanned"]:
+                reasons.append("source is a scan")
+            if item["ocr_used"]:
+                reasons.append("OCR used")
+            reasons.extend(json.loads(item["quality_issues"] or "[]"))
+            if item["math_count"]:
+                reasons.append(f"{item['math_count']} equation(s)")
+            pages.append(
+                {
+                    "page": item["page_number"],
+                    "state": item["verification_state"],
+                    "score": item["quality_score"],
+                    "reasons": reasons,
+                }
+            )
+        return {
+            "document_id": row["id"],
+            "document": row["title"] or row["filename"],
+            "pages": pages,
+        }
+
+    def record_ocr_review(
+        self,
+        document_ref: str,
+        page: int,
+        verdict: str,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Persist a visual OCR-review verdict without changing the source text.
+
+        A reviewer may approve a transcription, flag it for a correction, or
+        say that the scan cannot be read.  Corrections remain deliberate: this
+        method never lets a review result silently rewrite mathematical text.
+        """
+        states = {"approved", "needs_correction", "unreadable"}
+        if verdict not in states:
+            choices = ", ".join(sorted(states))
+            raise LibraryError(f"invalid review verdict {verdict!r}; use {choices}")
+        row = self.resolve(document_ref)
+        page_row = self.conn.execute(
+            "SELECT page_number FROM pages WHERE document_id=? AND page_number=?",
+            (row["id"], int(page)),
+        ).fetchone()
+        if page_row is None:
+            raise LibraryError(
+                f"page {page} is outside this document (1-{row['page_count']})"
+            )
+        cleaned_note = note.strip()
+        if verdict != "approved" and not cleaned_note:
+            raise LibraryError("a note is required for a non-approved review")
+        self.conn.execute(
+            """
+            UPDATE pages
+               SET verification_state=?, verification_note=?, verified_at=?
+             WHERE document_id=? AND page_number=?
+            """,
+            (verdict, cleaned_note or None, _now(), row["id"], int(page)),
+        )
+        return {
+            "document_id": row["id"],
+            "page": int(page),
+            "verdict": verdict,
+            "note": cleaned_note or None,
+        }
+
     def page_blocks(self, document_ref: str, page: int) -> list[dict[str, Any]]:
         """The laid-out regions of one page, when the engine reported them."""
         row = self.resolve(document_ref)
@@ -1021,8 +1241,8 @@ class Library:
         row = self.resolve(document_ref)
         target = normalize_query(section)
         candidates = self.conn.execute(
-            "SELECT DISTINCT heading FROM chunks "
-            "WHERE document_id = ? AND heading IS NOT NULL",
+            "SELECT DISTINCT COALESCE(raw_heading, heading) AS heading FROM chunks "
+            "WHERE document_id = ? AND COALESCE(raw_heading, heading) IS NOT NULL",
             (row["id"],),
         ).fetchall()
 
@@ -1043,7 +1263,8 @@ class Library:
             )
 
         chunks = self.conn.execute(
-            "SELECT * FROM chunks WHERE document_id = ? AND heading = ? ORDER BY ordinal",
+            "SELECT * FROM chunks WHERE document_id = ? "
+            "AND COALESCE(raw_heading, heading) = ? ORDER BY ordinal",
             (row["id"], best[1]),
         ).fetchall()
         return {
@@ -1103,10 +1324,20 @@ class Library:
                 "equations": aggregate["equations"],
                 "tables": aggregate["tables"],
                 "avg_quality": round(aggregate["avg_score"], 3),
-                # Pages still waiting for OCR, and pages whose text came from
-                # it -- different questions, and both worth answering.
+                "source_scanned_pages": self._pages_where(
+                    "source_scanned = 1", row["id"]
+                ),
+                "pending_ocr_pages": self._pages_where("needs_ocr = 1", row["id"]),
+                # Compatibility alias. New callers should use pending_ocr_pages.
                 "scanned_pages": self._pages_where("needs_ocr = 1", row["id"]),
                 "ocr_pages": self._pages_where("ocr_used = 1", row["id"]),
+                "verification_pending_pages": self._pages_where(
+                    "verification_state IN ('pending', 'needs_correction', 'unreadable')",
+                    row["id"],
+                ),
+                "verification_approved_pages": self._pages_where(
+                    "verification_state = 'approved'", row["id"]
+                ),
                 "low_quality_pages": self._pages_where(
                     "quality_state IN ('warning','bad')", row["id"]
                 ),
@@ -1116,6 +1347,14 @@ class Library:
                 ).fetchone()[0],
                 "error": row["error"],
                 "latest_job": dict(job) if job else None,
+                "engines": [
+                    item[0]
+                    for item in self.conn.execute(
+                        "SELECT DISTINCT engine FROM engine_runs WHERE document_id=? "
+                        "ORDER BY id",
+                        (row["id"],),
+                    ).fetchall()
+                ],
             }
         )
         return summary
@@ -1136,6 +1375,8 @@ class Library:
                 "math": r["math_count"],
                 "chars": r["char_count"],
                 "needs_ocr": bool(r["needs_ocr"]),
+                "verification": r["verification_state"],
+                "verification_note": r["verification_note"],
                 "issues": json.loads(r["quality_issues"] or "[]"),
             }
             for r in rows

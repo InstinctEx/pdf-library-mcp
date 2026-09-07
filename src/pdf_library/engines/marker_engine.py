@@ -133,6 +133,8 @@ class MarkerEngine:
     def _page_range(self, pages: list[int]) -> str:
         """Marker's --page_range is 0-based and accepts ranges like 0-4,7."""
         zero_based = sorted({p - 1 for p in pages if p >= 1})
+        if not zero_based:
+            raise EngineUnavailable("at least one positive page number is required")
         parts: list[str] = []
         start = prev = zero_based[0]
         for value in zero_based[1:]:

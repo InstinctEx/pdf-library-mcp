@@ -33,6 +33,10 @@ Markdown with LaTeX and cached on disk.
 Work in this order:
   1. `search_library` to find where something is discussed.
   2. `get_pages` or `get_chunk` to read only what the search pointed at.
+  3. Before relying on a scan-derived passage, check `ocr_review_queue`. For
+     each page you use, call `review_ocr_page`, compare image and transcript,
+     then call `record_ocr_review`. Never claim a page was visually checked
+     unless you actually received its image in this conversation.
 
 Never ask for a whole document. A single textbook is hundreds of thousands of
 tokens; the tools are built so you never need more than a few pages. Import
@@ -126,8 +130,8 @@ def import_pdf(path: str, force: bool = False) -> str:
     )
     return (
         f"Import started (job {job_id}) for {pdf_path.name}.\n"
-        "This runs in the background. Poll document_status with the filename "
-        "until status is 'complete'."
+        "This runs in the background. Poll job_status(job_id) until it reports "
+        "a document_id, then use document_status."
     )
 
 
@@ -372,6 +376,125 @@ def get_page_image(
 
 # ----------------------------------------------------------------------
 @server.tool(
+    name="review_ocr_page",
+    description=(
+        "Give a vision-capable AI everything needed to validate one OCR page: "
+        "the original page image and its saved Markdown transcription. Use this "
+        "for pages listed by ocr_review_queue, compare the image line by line "
+        "(especially formulas, numbers and names), then persist the result with "
+        "record_ocr_review. This tool never rewrites document text."
+    ),
+    structured_output=False,
+)
+def review_ocr_page(
+    document: str, page: int, max_tokens: int = 900
+) -> list[Any]:
+    """Show a source page beside its OCR transcription for visual verification.
+
+    Args:
+        document: Document id, filename or title.
+        page: 1-based page number selected from ocr_review_queue.
+        max_tokens: Approximate image-token budget (default 900).
+    """
+    library = _library()
+    try:
+        data = library.get_pages(document, [int(page)])
+        if not data["pages"]:
+            return [
+                f"No such page in {data['document']} "
+                f"(document has {data['page_count']} pages)."
+            ]
+        budget = max(150, min(int(max_tokens), _config.response.max_image_tokens * 2))
+        region = library.render_page_region(
+            document, int(page), max_tokens=budget
+        )
+        transcript = data["pages"][0]["markdown"]
+    except (LibraryError, ValueError) as exc:
+        return [str(exc)]
+    finally:
+        library.close()
+
+    instructions = (
+        f"OCR visual review — page {page}, {region.width}x{region.height}, "
+        f"about {region.estimated_tokens} image tokens.\n"
+        "Compare the image against the transcript below. Check every readable "
+        "formula, number, symbol, name and prose word; do not infer missing "
+        "content. Then call record_ocr_review with verdict='approved', "
+        "'needs_correction', or 'unreadable'. For either non-approved verdict, "
+        "include a concise note identifying the mismatch.\n\n"
+        f"{CONTENT_BANNER}\nOCR transcript:\n{transcript}"
+    )
+    return [_budget(instructions, "review one page at a time"), Image(data=region.data, format="jpeg")]
+
+
+# ----------------------------------------------------------------------
+@server.tool(
+    name="ocr_review_queue",
+    description=(
+        "List pages that still need a visual image-to-text OCR review, ordered "
+        "from highest risk to lowest. Use review_ocr_page for one page, then "
+        "record_ocr_review to save the verdict."
+    ),
+)
+def ocr_review_queue(document: str, limit: int = 10) -> str:
+    """List pending image-to-text OCR reviews.
+
+    Args:
+        document: Document id, filename or title.
+        limit: Maximum pages to return (1-100; default 10).
+    """
+    library = _library()
+    try:
+        data = library.ocr_review_queue(document, limit)
+    except LibraryError as exc:
+        return str(exc)
+    finally:
+        library.close()
+
+    if not data["pages"]:
+        return f"{data['document']}: no pages need visual OCR review."
+    lines = [f"{data['document']}: {len(data['pages'])} page(s) awaiting review."]
+    for item in data["pages"]:
+        reason = "; ".join(item["reasons"]) or "OCR/source risk"
+        score = "?" if item["score"] is None else f"{item['score']:.2f}"
+        lines.append(f"p{item['page']} [{item['state']}, quality {score}] — {reason}")
+    lines.append("Use review_ocr_page on one page, then record_ocr_review.")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+@server.tool(
+    name="record_ocr_review",
+    description=(
+        "Persist the result of a visual OCR comparison. This records a verdict "
+        "only; it never changes the transcript. Use approved only after the "
+        "original image and extracted text have been compared."
+    ),
+)
+def record_ocr_review(
+    document: str, page: int, verdict: str, note: str = ""
+) -> str:
+    """Save an OCR visual-review verdict.
+
+    Args:
+        document: Document id, filename or title.
+        page: 1-based page number just reviewed.
+        verdict: approved, needs_correction, or unreadable.
+        note: Required for needs_correction/unreadable; state the mismatch.
+    """
+    library = _library()
+    try:
+        result = library.record_ocr_review(document, page, verdict, note)
+    except LibraryError as exc:
+        return str(exc)
+    finally:
+        library.close()
+    suffix = f" — {result['note']}" if result["note"] else ""
+    return f"Recorded OCR review for page {result['page']}: {result['verdict']}{suffix}"
+
+
+# ----------------------------------------------------------------------
+@server.tool(
     name="list_documents",
     description=(
         "List every document in the library with its id, page count and "
@@ -410,8 +533,8 @@ def list_documents() -> str:
     description=(
         "Processing state and quality report for one document: whether it is "
         "complete, which pages are scanned or low quality, how many equations "
-        "were found, and which pages would benefit from re-extraction. Poll "
-        "this after import_pdf."
+        "were found, which pages await visual OCR review, and which pages would "
+        "benefit from re-extraction. Poll this after import_pdf."
     ),
 )
 def document_status(document: str) -> str:
@@ -440,12 +563,27 @@ def document_status(document: str) -> str:
         f"equations: {data['equations']}   tables: {data['tables']}   "
         f"chunks: {data['chunks']}   avg page quality: {data['avg_quality']}",
     ]
-    if data["scanned_pages"]:
-        lines.append(f"scanned pages (no text layer): {_compact(data['scanned_pages'])}")
+    if data["source_scanned_pages"]:
+        lines.append(
+            f"source scan pages: {_compact(data['source_scanned_pages'])}"
+        )
+    if data["pending_ocr_pages"]:
+        lines.append(
+            f"pages still pending OCR: {_compact(data['pending_ocr_pages'])}"
+        )
     if data["ocr_pages"]:
         lines.append(
             f"pages read by OCR (prose spelling is approximate): "
             f"{_compact(data['ocr_pages'])}"
+        )
+    if data["verification_pending_pages"]:
+        lines.append(
+            f"visual OCR review pending: {_compact(data['verification_pending_pages'])} "
+            "(use ocr_review_queue)"
+        )
+    if data["verification_approved_pages"]:
+        lines.append(
+            f"visually verified OCR pages: {_compact(data['verification_approved_pages'])}"
         )
     if data["low_quality_pages"]:
         lines.append(f"low quality pages: {_compact(data['low_quality_pages'])}")
@@ -456,11 +594,40 @@ def document_status(document: str) -> str:
         )
     if data["error"]:
         lines.append(f"error: {data['error']}")
+    if data["engines"]:
+        lines.append(f"engines used: {', '.join(data['engines'])}")
     job = data["latest_job"]
     if job and job["state"] in ("queued", "running"):
         lines.append(
             f"job {job['id']}: {job['state']} {job['progress']:.0%} {job['detail'] or ''}"
         )
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+@server.tool(
+    name="job_status",
+    description=(
+        "Return the exact state of a background import or reprocess job by the "
+        "job id returned when it was started. Use this immediately after an "
+        "import, before its document record exists."
+    ),
+)
+def job_status(job_id: str) -> str:
+    """Read one background job."""
+    job = _jobs().job(job_id)
+    if job is None:
+        return f"no such job: {job_id}"
+    lines = [
+        f"job {job['id']} ({job['kind']})",
+        f"state: {job['state']}   progress: {job['progress']:.0%}",
+    ]
+    if job["detail"]:
+        lines.append(f"detail: {job['detail']}")
+    if job["document_id"]:
+        lines.append(f"document_id: {job['document_id']}")
+    if job["error"]:
+        lines.append(f"error: {job['error']}")
     return "\n".join(lines)
 
 
@@ -512,7 +679,7 @@ def reprocess(
     )
     return (
         f"Reprocessing {len(targets)} page(s) with {name} (job {job_id}). "
-        "Poll document_status; other pages keep their cached text meanwhile."
+        "Poll job_status or document_status; other pages keep their cached text meanwhile."
     )
 
 

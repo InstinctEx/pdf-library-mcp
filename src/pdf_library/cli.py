@@ -139,6 +139,29 @@ def cmd_report(args: argparse.Namespace, library: Library) -> int:
     return 0
 
 
+def cmd_review_queue(args: argparse.Namespace, library: Library) -> int:
+    data = library.ocr_review_queue(args.document, args.limit)
+    if not data["pages"]:
+        print("No pages need visual OCR review.")
+        return 0
+    for item in data["pages"]:
+        reasons = "; ".join(item["reasons"]) or "OCR/source risk"
+        score = "?" if item["score"] is None else f"{item['score']:.2f}"
+        print(f"p{item['page']}  {item['state']:<16} quality={score}  {reasons}")
+    print("Use the MCP review_ocr_page tool to compare a page image and transcript.")
+    return 0
+
+
+def cmd_review_mark(args: argparse.Namespace, library: Library) -> int:
+    result = library.record_ocr_review(
+        args.document, args.page, args.verdict, args.note
+    )
+    print(f"p{result['page']}: {result['verdict']}")
+    if result["note"]:
+        print(result["note"])
+    return 0
+
+
 def cmd_reprocess(args: argparse.Namespace, library: Library) -> int:
     result = library.upgrade_pages(
         library.resolve(args.document)["id"],
@@ -192,6 +215,8 @@ def cmd_repair(args: argparse.Namespace, library: Library) -> int:
     print(f"repaired {result['pages_changed']} page(s): {result['pages']}")
     for name, count in sorted(result["counts"].items()):
         print(f"  {name}: {count}")
+    for change in result.get("changes", []):
+        print(f"  p{change['page']}: {change['original']} → {change['replacement']}")
     print(f"  reindexed into {result['chunk_count']} chunks")
     return 0
 
@@ -308,6 +333,10 @@ def cmd_config(args: argparse.Namespace, library: Library) -> int:
     print(f"auto upgrade    {config.extraction.auto_upgrade}")
     print(f"upgrade below   {config.extraction.upgrade_below_score}")
     print(f"max resp tokens {config.response.max_response_tokens}")
+    print(f"greek lexicon   {config.repair.greek_lexicon or '(disabled)'}")
+    print(f"greek hunspell  {config.repair.greek_hunspell or '(auto-discover)'}")
+    print(f"max PDF bytes   {config.safety.max_pdf_bytes or '(unlimited)'}")
+    print(f"max PDF pages   {config.safety.max_pdf_pages or '(unlimited)'}")
     return 0
 
 
@@ -355,6 +384,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("document")
     p.add_argument("--problems-only", action="store_true")
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("review-queue", help="pages awaiting visual OCR review")
+    p.add_argument("document")
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(func=cmd_review_queue)
+
+    p = sub.add_parser("review-mark", help="record a visual OCR review verdict")
+    p.add_argument("document")
+    p.add_argument("page", type=int)
+    p.add_argument("verdict", choices=("approved", "needs_correction", "unreadable"))
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_review_mark)
 
     p = sub.add_parser("reprocess", help="re-extract pages with the quality engine")
     p.add_argument("document")

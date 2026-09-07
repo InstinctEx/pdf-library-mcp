@@ -87,6 +87,7 @@ class Chunk:
     heading: str | None
     chunk_type: str
     content: str
+    raw_heading: str | None = None
 
     @property
     def char_count(self) -> int:
@@ -275,6 +276,7 @@ def chunk_pages(
                     heading=heading,
                     chunk_type=classify(heading, text),
                     content=text,
+                    raw_heading=heading,
                 )
             )
             ordinal += 1

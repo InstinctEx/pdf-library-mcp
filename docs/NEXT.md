@@ -5,11 +5,29 @@ the way it is. Everything below is agreed work, in order.
 
 ## Where things stand
 
-- 166 tests pass: `PYTHONPATH=src .venv/bin/python -m pytest tests -q`
+- 183 tests pass: `PYTHONPATH=src .venv/bin/python -m pytest tests -q`
+- Visual OCR review is now explicit: source scans/OCR pages enter a persisted
+  queue; a vision-capable AI receives the original image and transcript, then
+  records an audited verdict without silently editing the document.
 - Lint clean: `.venv/bin/ruff check src tests tools benchmarks --select F,E9`
 - Both engines work. `pdf-library doctor` should show green for the fast
   engine, Marker and llama-server.
 - Everything through `pdf-library repair` is committed and pushed.
+
+## Completed in the reliability pass
+
+- **C. Contradictory definitions:** implemented as a quality warning; it never
+  guesses a missing prime.
+- **D. Repeated headings:** consecutive repeats now render as `(1/5)` through
+  `(5/5)`, while `get_section` still matches the unsuffixed heading.
+- **B. Deterministic repair infrastructure:** `pdf-library repair` can use the
+  local, inflection-aware Greek Hunspell dictionary or a configured UTF-8
+  wordlist. It corrects only a unique candidate reachable through the
+  documented handwriting confusions, leaves all math spans unchanged, and
+  prints an audit trail.
+- Imports and upgrades now have exact `job_status` polling, stale jobs are
+  explicitly failed after a server restart, and source scans are kept distinct
+  from pages still pending OCR.
 
 The test corpus that matters is a scanned, handwritten Greek maths PDF —
 17 pages, integration by parts and partial fractions. Its mathematics extracts
@@ -36,7 +54,7 @@ should be built around:
 
 ---
 
-## C. Flag contradictory definitions
+## C. Flag contradictory definitions — complete
 
 **Why.** `g(x) = ημx → g(x) = −συνx` says one symbol equals two different
 things. A machine can see that; it cannot see which side lost the prime.
@@ -56,7 +74,7 @@ Estimated: half an hour.
 
 ---
 
-## D. Number repeated headings
+## D. Number repeated headings — complete
 
 **Why.** Five chunks titled «Βήμα 3» are indistinguishable in a search result,
 which defeats the point of having headings at all.
@@ -77,7 +95,7 @@ Estimated: fifteen minutes.
 
 ---
 
-## B. Confusion-constrained Greek spellcheck
+## B. Confusion-constrained Greek spellcheck — infrastructure complete
 
 The biggest free win. Deterministic, no model.
 

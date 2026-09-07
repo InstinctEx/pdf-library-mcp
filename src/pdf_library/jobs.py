@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import Config
-from .db import connect
+from .db import connect, init_db
 from .library import Library
 
 JobBody = Callable[[Library, Callable[[float, str], None]], dict[str, Any]]
@@ -39,6 +39,18 @@ class JobRunner:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        # A runner owns only in-memory futures.  Jobs left queued/running by a
+        # previous server cannot resume safely, so make their failure explicit
+        # instead of leaving callers polling forever.
+        conn = init_db(config.db_path)
+        try:
+            conn.execute(
+                "UPDATE jobs SET state='failed', error=?, detail='interrupted', "
+                "finished_at=? WHERE state IN ('queued','running')",
+                ("server restarted before this job completed", _now()),
+            )
+        finally:
+            conn.close()
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdflib")
         self._futures: dict[str, Future[dict[str, Any]]] = {}
         self._lock = threading.Lock()
@@ -89,10 +101,11 @@ class JobRunner:
             traceback.print_exc()
             raise
         else:
+            document_id = result.get("import") if isinstance(result, dict) else None
             conn.execute(
                 "UPDATE jobs SET state='complete', progress=1.0, finished_at=?, "
-                "detail='done' WHERE id=?",
-                (_now(), job_id),
+                "detail='done', document_id=COALESCE(?, document_id) WHERE id=?",
+                (_now(), document_id, job_id),
             )
             return result
         finally:

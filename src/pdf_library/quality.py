@@ -31,6 +31,11 @@ _LABEL_DENOMINATOR = re.compile(
 _SINGLE_LABEL_DENOMINATOR = re.compile(
     r"\\frac\{[^{}]*\}\{\s*" + _LABEL + r"\s*\}"
 )
+_CONTRADICTORY_DEFINITION = re.compile(
+    r"(?P<lhs>[A-Za-zα-ωΑ-Ω][A-Za-zα-ωΑ-Ω0-9_]*(?:\([^)]*\))?)\s*=\s*"
+    r"(?P<first>[^=]+?)\s*(?:\\to|\\rightarrow|→)\s*"
+    r"(?P=lhs)\s*=\s*(?P<second>[^=]+)"
+)
 
 
 @dataclass
@@ -120,6 +125,18 @@ def assess_page(markdown: str) -> PageQuality:
         total = confirmed + len(_SINGLE_LABEL_DENOMINATOR.findall(markdown))
         issues.append(f"underbrace_as_fraction:{total}")
         score -= min(0.45, 0.15 * total)
+
+    contradictory = 0
+    spans = [*_DISPLAY_MATH.findall(markdown), *_INLINE_MATH.findall(markdown)]
+    for span in spans:
+        for match in _CONTRADICTORY_DEFINITION.finditer(span):
+            first = re.sub(r"\s+", "", match.group("first")).rstrip(".,;")
+            second = re.sub(r"\s+", "", match.group("second")).rstrip(".,;")
+            if first != second:
+                contradictory += 1
+    if contradictory:
+        issues.append(f"contradictory_definition:{contradictory}")
+        score -= min(0.25, 0.1 * contradictory)
 
     score = max(0.0, min(1.0, score))
     if score >= 0.75:

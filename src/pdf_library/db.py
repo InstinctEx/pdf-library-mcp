@@ -241,13 +241,49 @@ def _migrate(conn: sqlite3.Connection) -> bool:
 def rebuild_index(conn: sqlite3.Connection) -> None:
     """Repopulate the search index from the chunks table.
 
-    An external-content FTS5 index and its content table have to agree:
-    deleting a chunk issues a 'delete' command carrying the old values, and if
-    the index holds no such entry SQLite reports the database as malformed.
-    A newly created index is empty, so it must be rebuilt before anything
-    touches `chunks`. Note that counting rows in the index is no test of this
-    -- for an external-content table those rows are read from the content.
+    An external-content FTS5 index and its content table have to agree.
+    Normally FTS5's built-in rebuild is enough. If the FTS shadow tables are
+    damaged or inconsistent, discard only the derived FTS index, recreate it
+    from its schema, restore its triggers, and rebuild from the authoritative
+    `chunks` table.
     """
+    try:
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        return
+    except sqlite3.DatabaseError:
+        pass
+
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='chunks_fts'"
+    ).fetchone()
+    if not row or not row[0]:
+        raise sqlite3.DatabaseError("chunks_fts schema is missing")
+
+    fts_sql = row[0]
+
+    trigger_sql = [
+        row[0]
+        for row in conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='trigger' "
+            "AND name IN ('chunks_ai', 'chunks_ad', 'chunks_au') "
+            "ORDER BY name"
+        )
+        if row[0]
+    ]
+
+    for name in ("chunks_ai", "chunks_ad", "chunks_au"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+
+    # chunks is the source of truth. The FTS table and its shadow tables are
+    # disposable derived data, so recreating them cannot lose document text.
+    conn.execute("DROP TABLE IF EXISTS chunks_fts")
+    conn.execute(fts_sql)
+
+    for sql in trigger_sql:
+        conn.execute(sql)
+
     conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
 
 

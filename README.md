@@ -1,446 +1,1112 @@
 # pdf-library-mcp
 
-A local library for mathematical PDFs. Each document is converted to Markdown
-once, cached forever, indexed for search, and exposed to Claude over MCP — so
-answering a question about a 500-page textbook costs a few hundred tokens
-instead of the whole book.
+**A local-first MCP server for mathematical PDFs, scanned notes, and technical documents.**
 
-Built for maths, physics and CS material, in English and Greek, including
-scanned and handwritten lecture notes.
+Import a PDF once, turn it into searchable Markdown, cache it permanently, and let AI clients retrieve only the pages or sections they actually need.
 
+Built for mathematics, physics, computer science, English and Greek material, including scanned and handwritten lecture notes.
+
+```text
+PDF
+ │
+ ▼
+Hash + inspect
+ │
+ ▼
+Fast extraction
+ │
+ ├── good enough ───────────────────────────────┐
+ │                                             │
+ └── suspicious / scanned / math-heavy         │
+                  │                            │
+                  ▼                            │
+             Marker OCR                        │
+                  │                            │
+                  ▼                            │
+       optional MLX-VLM correction             │
+                  │                            │
+                  └──────────────┬─────────────┘
+                                 ▼
+                         canonical Markdown
+                                 │
+                         cache + index
+                                 │
+                                 ▼
+                               MCP
 ```
-PDF → hash → inspect → extract → quality gate → cache → index → MCP
-                                       ↓
-                         flag the pages worth re-doing properly
+
+The goal is simple:
+
+> **Do the expensive document work once. Retrieve only what the agent needs afterward.**
+
+A 500-page textbook should not cost 500 pages of context every time you ask a question about it.
+
+---
+
+## Why this exists
+
+There are already excellent PDF extraction tools.
+
+The missing piece is that they are mostly **extractors**, not **libraries**.
+
+| Project | What it gives | What is still missing |
+| --- | --- | --- |
+| **PyMuPDF4LLM** | Very fast local Markdown extraction, layout and tables | Weak mathematical extraction, no persistent library or search |
+| **Marker** | Strong LaTeX, reading order and OCR | Much slower, model-heavy, no persistent retrieval layer |
+| **MinerU** | Strong formula-aware document parsing | Still primarily an extractor |
+| **Generic PDF MCP servers** | Page retrieval and search | Usually not designed around mathematical documents, OCR quality or page-level correction |
+
+`pdf-library-mcp` sits above the extraction engines.
+
+It remembers what has already been processed, indexes the result, identifies bad pages, upgrades only those pages, and exposes the library to an AI client through MCP.
+
+It adds:
+
+- **Content-addressed caching**
+- **Fast and high-quality extraction tiers**
+- **Per-page upgrades**
+- **Mathematics-aware quality checks**
+- **Greek-aware search**
+- **OCR repair**
+- **Visual OCR review**
+- **Local MLX-VLM OCR correction**
+- **Page-level provenance and correction history**
+- **Token-budgeted retrieval**
+- **Original-page image access when OCR cannot be trusted**
+
+The extraction engines remain replaceable.
+
+---
+
+# Core idea
+
+A PDF is identified by the SHA-256 hash of its bytes.
+
+Import the exact same PDF twice and the second import performs:
+
+```text
+no extraction
+no OCR
+no model inference
 ```
 
----
+The existing cached document is returned instead.
 
-## Why this exists, and why it isn't a fork
-
-There are several good PDF-extraction projects. This is not a replacement for
-any of them — it depends on two. The problem is that each solves one part of
-the job, and the part that was missing is the part that matters for daily use
-with an agent.
-
-| Project | What it gives | What was still missing |
-| --- | --- | --- |
-| **PyMuPDF4LLM** | Very fast, local, layout-aware Markdown with tables | No LaTeX. It silently drops display equations. No persistence, no search |
-| **Marker** | Genuinely good LaTeX for equations, strong reading order, OCR via its own models | ~100× slower. Nothing is cached; every read re-runs the models |
-| **MinerU** | Another strong formula-aware extractor | Same: an extractor, not a library |
-| **Existing PDF MCP servers** | Search and selective page reading | Built around generic documents; mathematics is not a first-class concern |
-
-Every one of those is an **extractor**. What a person actually needs when
-reading maths with an agent is a **library**: something that remembers it
-already read the book, knows which pages came out badly, and hands back three
-pages instead of eight hundred.
-
-That layer is what this project is. Concretely, it adds:
-
-- **Content-addressed caching.** A document is identified by the SHA-256 of its
-  bytes. Re-importing the same file runs no extraction, no OCR, no model.
-- **Two quality tiers with a per-page upgrade path**, so a book is searchable in
-  seconds and only the pages that need the slow engine ever see it.
-- **A quality gate that detects silently lost mathematics** — the failure mode
-  no extractor reports and no check on the output can see.
-- **Greek as a first-class language**, at every layer from OCR repair to search.
-- **An MCP interface built around a token budget**, where search returns
-  snippets and content arrives only when asked for — including an image of the
-  original page, priced and opt-in, for when the text cannot be trusted.
-
-Forking any single extractor would have meant inheriting its licence and its
-scope while still writing all of the above. Depending on them behind an
-interface keeps each one replaceable — and keeps the GPL one at a process
-boundary.
+Storage is page-based, which means one bad page can be reprocessed without touching the other 800 pages in the book.
 
 ---
 
-## Two tiers, not a choice of engine
+# Extraction pipeline
 
-Running a model-based extractor over an 800-page textbook takes hours. Waiting
-that long before the book is usable is the wrong trade, so import and quality
-are separate stages:
+There are now three levels of document processing.
 
-| Tier | Engine | Speed | Produces |
-| --- | --- | --- | --- |
-| `fast` | PyMuPDF4LLM | ~11 pages/second, no models | Structure, prose, tables. Superscripts become inline LaTeX. Display equations are often **lost** |
-| `high` | Marker | ~0.1 pages/second on an Apple-silicon GPU | Real LaTeX for display and inline maths, better multi-column order, OCR for scans |
+## 1. Fast extraction
 
-Measured on the LaTeX test fixture with warm models
-(`benchmarks/compare_engines.py`): Marker is about **120× slower** and recovers
-**every** display equation the fast tier dropped.
+**Engine:** PyMuPDF4LLM
 
-Import always runs the fast tier. The quality gate then marks which pages are
-worth upgrading, and `reprocess` sends only those to Marker. Everything else
-keeps its cached text. Upgrading one page never touches the other 842.
+Designed to make a document searchable quickly.
 
----
+It handles:
 
-## Three findings that shaped the design
+- prose
+- headings
+- tables
+- basic layout
+- text-layer PDFs
 
-These came out of running the thing on real material, and each one changed the
-code.
+It is extremely fast, but mathematical PDFs expose an important weakness:
 
-### 1. Lost equations are invisible in the output
+> Display equations can disappear completely.
 
-The damaging failure is silent: the fast extractor drops a display equation and
-leaves a blank line. Nothing in the resulting Markdown says anything is wrong —
-it is perfectly well-formed text that happens to be missing the mathematics.
-
-So the gate reads the page's **fonts** instead of its text. A page typeset with
-TeX's large-operator and extensible-delimiter fonts (`CMEX`, the AMS symbol
-fonts, any OpenType math font) that produces no `$$` block lost its equations,
-and is flagged `display_math_missing`.
-
-On a real LaTeX textbook this fires on nearly every page. That is the honest
-answer: for that material the fast tier is a search index, and Marker is how you
-read the maths.
-
-### 2. Greek inflection destroys keyword search
-
-SQLite's `unicode61` tokeniser does no stemming, so *μερικά κλάσματα* failed to
-find *μερικών κλασμάτων* — the same phrase in a different case. Accent folding
-does not help, because the endings genuinely differ.
-
-The index therefore applies accent folding, final-sigma normalisation, and a
-light Greek stemmer, with identical treatment of queries. LaTeX is stripped from
-the indexed text as well, so `\int_{-\infty}^{\infty}` cannot pollute ranking
-while the readable Markdown keeps it untouched.
-
-### 3. Search has to survive the OCR, not assume it
-
-Two separate problems, two separate answers. Greek inflection is regular, so a
-stemmer handles it. OCR damage is not: *παραγοντική* read as *παραχουτική*
-differs in two places at once, and no rule recovers that.
-
-So search widens in three stages, and stops at the first that finds anything:
-
-| Stage | Matches | Reported as |
-| --- | --- | --- |
-| exact | every word present, after folding and stemming | `exact` |
-| partial | any word present | `partial` |
-| approximate | character trigrams overlap | `approximate` |
-
-The trigram index is scored an order of magnitude lower than real word
-matches, so it can never outrank them — it only exists for the case where
-nothing else found anything. Results carry the stage that produced them,
-because an approximate match deserves to be read as one.
-
-### 4. No OCR model knows Greek mathematical notation
-
-Greek textbooks write the trigonometric functions with Greek names: `ημ` for
-sine, `συν` for cosine, `εφ` for tangent. Two things go wrong, and both are
-deterministic to fix:
-
-- The characters are misread. In handwriting the σ of `συν` looks like a 6 and
-  the υν like 0v, so `συνx` is transcribed faithfully but meaninglessly as
-  `60vx`.
-- Even when the characters are right, they are typeset as separate variables:
-  `ημx` becomes `\eta \mu x`, which renders as the product η·μ·x rather than
-  sin(x).
-
-Because the set of Greek function names is small and closed, both are repaired
-deterministically — inside math spans only, so ordinary words like *ημέρα* and
-*εφαρμογή* are never touched. The repair is gated on the document actually
-using that notation, and `pdf-library repair` applies it to documents already on
-disk without re-running OCR.
-
-### 5. The errors worth fixing are the ones that change the meaning
-
-Reading three OCR'd pages against their originals turned up four kinds of
-mis-parse, and they do not all deserve the same treatment.
-
-Two are mechanical and are repaired outright. Words broken across a line come
-back either split (`παραγο-` / `-ντική`) or already joined with the tail
-emitted a second time (`ολοκλήρωμα` / `- ρωμα`), and the two shapes need
-opposite handling. And the Greek article η is a single letter, so OCR reads it
-as a Latin `h` and, because it stands alone, files it as a mathematical
-variable: `η δυσκολία` becomes `$h$ δυσκολία`.
-
-One is only reported, deliberately. An underbrace annotation — a term with
-`f(x)` and `g'(x)` written underneath — is extracted as a *fraction* over those
-labels. The output is valid LaTeX that means something else entirely, and no
-check on the text alone can see it. But `\frac{g'(x)}{g(x)}` is also a perfectly
-ordinary logarithmic derivative, so removing it automatically would break real
-mathematics. Pages are flagged `underbrace_as_fraction` instead, and the reader
-is pointed at the image.
-
-The fourth is not fixable and is not pretended otherwise: OCR of handwritten
-Greek confuses γ with χ, η with υ, σ with δ. That is what the trigram index and
-the image are for.
-
-### 6. Lecture notes have structure, just not Markdown structure
-
-Handwritten notes contain no headings, so size-based chunking produced a dozen
-untitled fragments. But the structure is there in the words: *Παράδειγμα*,
-*Λύση*, *Περίπτωση 2*, *Βήμα 3*, *Θεώρημα 2.5*. Those are recognised on their
-folded stems and become both the chunk heading and its type, which makes
-`search --type solution` and `get_section` work on material that has no
-headings at all.
-
-OCR damages those words too — *Λύση* arrives as *Λύψ*, *Εφαρμογή* as
-*Εφαρμόχή* — and an exact match loses the heading on exactly the pages that
-need one most, so near-matches are accepted. That tolerance has to be paid for:
-it would otherwise promote *Εφαρμόζουμε*, the verb built on the same root as
-the heading *Εφαρμογή*. Two guards keep it honest — a marker must begin with a
-capital, and must not end in a verb ending.
+The resulting Markdown may still look perfectly valid, which makes the failure difficult to detect by inspecting the extracted text alone.
 
 ---
 
-## The image escape hatch
+## 2. High-quality extraction
 
-Extraction of handwriting will never be perfect, and no amount of repair
-changes that. So there is one tool that shows the reader the original — and it
-is the only expensive thing here, which is why it is opt-in and priced.
+**Engine:** Marker
 
-Measured on a page of handwritten Greek notes:
+Marker is used when a page deserves heavier processing.
 
-| | tokens | vs. the page's text |
-| --- | --- | --- |
-| The page's extracted text | 364 | — |
-| Full page image, 150 dpi | 2318 | 6.4× |
-| **One equation, cropped** | **385** | **1.1×** |
+It provides:
 
-Cropping is not just cheaper — at the same budget the equation is rendered
-1510×448 instead of 692×977, so it is both cheaper *and* sharper than the page
-that contains it. Because Marker's JSON output gives a bounding box for every
-block, `get_pages` tells the reader which blocks on an OCR'd page are equations,
-and `get_page_image(page=4, block=2)` shows exactly that one.
+- much stronger LaTeX extraction
+- OCR for scanned pages
+- better mathematical layout
+- better reading order
+- block-level bounding boxes
 
-Images are never returned by any other tool, never automatically, and the
-render scale is derived from a token budget rather than a DPI, so asking for
-"about 400 tokens" gets the largest image that fits.
+Import does **not** blindly run Marker over every page.
 
-### Visual OCR review
+Instead:
 
-For scan-derived pages, the library now keeps a separate visual-review queue.
-A vision-capable AI calls `ocr_review_queue`, then `review_ocr_page` for one
-page. The latter returns the original page image and saved Markdown together,
-so the AI can compare symbols, numbers, formulas and prose before recording
-`approved`, `needs_correction`, or `unreadable` through
-`record_ocr_review`. A verdict is an audit record only: it cannot silently
-rewrite the document. Any new extraction that changes a scanned page returns
-that page to the review queue.
+```text
+fast extraction
+      │
+      ▼
+ quality gate
+      │
+      ├── page looks good → keep fast result
+      │
+      └── page looks suspicious → candidate for reprocessing
+```
 
-## On speed
+A single page can then be upgraded with:
 
-Both tiers are bounded by third-party model inference, and the rest was
-measured rather than assumed:
+```bash
+pdf-library reprocess real-analysis --pages 243
+```
 
-- The fast tier runs at ~27 pages/second, of which 96% is PyMuPDF's ONNX layout
-  model. It cannot be switched off — pymupdf4llm requires it — so that is the
-  floor.
-- Marker runs at ~0.1 pages/second. A `reprocess` of many pages is already a
-  single invocation, so the model load is paid once rather than per page.
-- Everything else is noise: opening the library and running a search costs
-  0.55 ms, so the MCP server's per-call setup is not worth caching.
+The rest of the document remains untouched.
 
-The real speed feature is that none of this happens twice. A re-import is a
-cache hit in about a millisecond, reindexing never re-extracts, and `repair`
-fixes stored text without touching OCR.
+---
+
+## 3. Local vision OCR correction
+
+For difficult scanned or handwritten material, Marker is not always enough.
+
+The library can optionally send the original page image together with the existing OCR transcription to a **local Vision Language Model running through MLX-VLM**.
+
+This is particularly useful for:
+
+- handwritten notes
+- Greek handwriting
+- mathematical notation
+- inverse functions
+- hyperbolic functions
+- superscripts and subscripts
+- OCR errors that are impossible to detect from text alone
+
+The pipeline becomes:
+
+```text
+Marker transcription
+        +
+original page image
+        │
+        ▼
+     MLX-VLM
+        │
+        ▼
+vision comparison
+        │
+        ▼
+corrected Markdown + LaTeX
+```
+
+The vision model is instructed to **transcribe**, not solve or rewrite the mathematics.
+
+For example, it is explicitly told to distinguish:
+
+```text
+sinh  cosh  tanh  coth  sech  csch
+```
+
+from:
+
+```text
+sin   cos   tan   cot   sec   csc
+```
+
+and preserve notation such as:
+
+```latex
+\sinh^{-1}(x)
+```
+
+rather than silently changing what appears on the page.
+
+---
+
+# MLX-VLM on Apple Silicon
+
+The recommended vision backend on Apple Silicon is **MLX-VLM**.
+
+The MCP server talks to its local OpenAI-compatible API, so the vision backend is isolated from the rest of the library.
 
 ## Install
 
+Create a separate environment if desired:
+
+```bash
+python3 -m venv ~/.venvs/pdf-vision
+source ~/.venvs/pdf-vision/bin/activate
+
+pip install -U mlx-vlm
+```
+
+Start a local model:
+
+```bash
+python -m mlx_vlm.server \
+  --model mlx-community/Qwen3-VL-8B-Instruct-4bit
+```
+
+For an Apple Silicon Mac with limited unified memory, a quantized 7B/8B vision model is a sensible starting point.
+
+---
+
+## Configure the library
+
+Add to `config.toml`:
+
+```toml
+[vision]
+enabled = true
+
+base_url = "http://127.0.0.1:8080/v1"
+model = "mlx-community/Qwen3-VL-8B-Instruct-4bit"
+
+timeout_seconds = 300
+render_scale = 3.0
+
+temperature = 0.0
+max_tokens = 4096
+
+apply_min_confidence = 0.80
+```
+
+The high-resolution renderer used for vision OCR is separate from the token-budgeted renderer used when sending images through MCP.
+
+That distinction is intentional:
+
+```text
+MCP image
+→ optimized for context/token cost
+
+Vision OCR image
+→ optimized for transcription accuracy
+```
+
+---
+
+# OCR correction safety
+
+Vision models are useful, but they are not allowed to silently rewrite the library.
+
+Every vision correction records:
+
+```text
+original Markdown
+corrected Markdown
+model
+confidence
+status
+warnings
+whether it was applied
+timestamp
+```
+
+The original OCR is therefore preserved.
+
+A correction can be generated without applying it:
+
+```text
+correct_ocr_page(
+    document="notes.pdf",
+    page=4,
+    apply=false
+)
+```
+
+or for several pages:
+
+```text
+correct_ocr_pages(
+    document="notes.pdf",
+    pages=[1, 2, 3, 4],
+    apply=false
+)
+```
+
+After inspection:
+
+```text
+correct_ocr_pages(
+    document="notes.pdf",
+    pages=[1, 2, 3, 4],
+    apply=true
+)
+```
+
+A correction is only automatically accepted when it satisfies the configured confidence threshold.
+
+Low-confidence pages remain available for review instead.
+
+---
+
+# Why OCR needs visual verification
+
+Some errors cannot be detected from the extracted text.
+
+Consider an underbrace annotation.
+
+A handwritten or typeset expression with:
+
+```text
+f(x)
+g'(x)
+```
+
+written underneath terms may be interpreted by OCR as a fraction.
+
+The resulting output can be perfectly valid LaTeX while representing completely different mathematics.
+
+Text-only validation cannot reliably detect that.
+
+The original page remains the source of truth.
+
+---
+
+# Visual OCR review
+
+Scan-derived pages have a separate review workflow.
+
+An AI client can request:
+
+```text
+ocr_review_queue
+```
+
+and then inspect one page with:
+
+```text
+review_ocr_page
+```
+
+The tool returns:
+
+- the original page image
+- the saved Markdown transcription
+
+The client can then record:
+
+```text
+approved
+needs_correction
+unreadable
+```
+
+using:
+
+```text
+record_ocr_review
+```
+
+Manual visual-review verdicts are audit records.
+
+They do not silently modify the transcription.
+
+A new extraction that changes the page returns it to the review queue.
+
+---
+
+# Mathematics-aware quality detection
+
+One of the most damaging extraction failures is also one of the least obvious:
+
+> A display equation disappears and leaves behind a blank line.
+
+The resulting Markdown contains no malformed LaTeX and no obvious error.
+
+To detect this, the library inspects the **fonts used by the original PDF page**.
+
+Pages containing TeX mathematical fonts such as:
+
+```text
+CMEX
+AMS symbol fonts
+OpenType mathematical fonts
+```
+
+but producing no display-math block can be flagged as:
+
+```text
+display_math_missing
+```
+
+This allows the library to identify pages that deserve high-quality reprocessing even when their extracted Markdown appears superficially valid.
+
+---
+
+# Greek is a first-class language
+
+Greek technical documents introduce problems that ordinary Unicode search does not solve.
+
+## Inflection-aware search
+
+SQLite's `unicode61` tokenizer does not stem Greek words.
+
+For example:
+
+```text
+μερικά κλάσματα
+```
+
+should still find:
+
+```text
+μερικών κλασμάτων
+```
+
+The index therefore performs:
+
+- accent folding
+- final-sigma normalization
+- lightweight Greek stemming
+- identical normalization of queries
+
+LaTeX is removed from the search index while remaining untouched in the readable Markdown.
+
+---
+
+# Search that survives OCR
+
+OCR corruption is not the same problem as grammatical inflection.
+
+The library therefore searches in stages.
+
+| Stage | Behaviour | Result label |
+| --- | --- | --- |
+| Exact | All normalized/stemmed words present | `exact` |
+| Partial | At least one query word present | `partial` |
+| Approximate | Character-trigram similarity | `approximate` |
+
+Search stops at the first stage that produces useful results.
+
+Approximate matches receive a much lower score than real lexical matches, so OCR-tolerant search can rescue a failed query without outranking correct results.
+
+---
+
+# Greek mathematical notation repair
+
+Greek mathematical material frequently uses localized trigonometric names:
+
+```text
+ημ   → sine
+συν  → cosine
+εφ   → tangent
+```
+
+OCR creates two recurring problems.
+
+### Character confusion
+
+Handwriting may turn:
+
+```text
+συνx
+```
+
+into something resembling:
+
+```text
+60vx
+```
+
+### Incorrect mathematical interpretation
+
+Even correctly recognized characters may become separate variables:
+
+```text
+ημx
+```
+
+can be emitted as:
+
+```latex
+\eta \mu x
+```
+
+which means the product:
+
+```text
+η · μ · x
+```
+
+rather than a function.
+
+Because the set of Greek mathematical function names is small and closed, these cases can be repaired deterministically.
+
+Repairs are applied **inside mathematics only** so ordinary Greek words are not modified.
+
+Existing documents can be repaired without rerunning OCR:
+
+```bash
+pdf-library repair real-analysis
+```
+
+---
+
+# Handwritten Greek OCR repair
+
+Several deterministic OCR failures are also handled.
+
+Examples include:
+
+- words split across lines
+- duplicated word tails after line breaks
+- the Greek article `η` being recognized as Latin `h`
+- known mathematical-function substitutions
+
+Other handwriting errors are deliberately **not guessed**.
+
+Greek handwriting frequently confuses characters such as:
+
+```text
+γ ↔ χ
+η ↔ υ
+σ ↔ δ
+```
+
+Those cases are better handled by:
+
+- approximate search
+- visual review
+- the optional MLX-VLM correction layer
+
+rather than aggressive automatic replacement.
+
+---
+
+# Lecture-note structure
+
+Handwritten lecture notes often have no Markdown headings.
+
+They still contain semantic structure such as:
+
+```text
+Παράδειγμα
+Λύση
+Περίπτωση 2
+Βήμα 3
+Θεώρημα 2.5
+```
+
+The chunker recognizes these markers and can use them as both:
+
+- chunk headings
+- semantic chunk types
+
+This makes queries such as:
+
+```text
+search --type solution
+```
+
+possible even when the original notes have no formal document structure.
+
+OCR-damaged near-matches are tolerated with safeguards against accidentally turning ordinary verbs into headings.
+
+---
+
+# The image escape hatch
+
+OCR will never be perfect.
+
+For that reason the library can expose the original page to the AI client.
+
+Images are:
+
+- opt-in
+- never returned by ordinary search
+- rendered according to a token budget
+- optionally cropped to a single detected block
+
+For example:
+
+```text
+get_page_image(page=4)
+```
+
+returns the page.
+
+But:
+
+```text
+get_page_image(page=4, block=2)
+```
+
+can return only one equation.
+
+That is often both cheaper and sharper than sending the whole page.
+
+Marker's block bounding boxes make this possible.
+
+---
+
+# Performance
+
+The expensive parts of the pipeline are third-party extraction and model inference.
+
+Everything else is intentionally lightweight.
+
+The important optimization is not shaving milliseconds from SQLite.
+
+It is this:
+
+> **Extraction should never happen twice unless the user explicitly asks for it.**
+
+A cached document can be reopened and searched without running:
+
+- PyMuPDF extraction
+- Marker
+- OCR
+- MLX-VLM
+
+Reindexing also does not re-extract PDFs.
+
+Text repair modifies cached text without rerunning OCR.
+
+---
+
+# Installation
+
+Requires Python 3.11.
+
 ```bash
 python3.11 -m venv .venv
+
 .venv/bin/pip install -e .
+
 .venv/bin/pdf-library doctor
 ```
 
-The quality engine is optional and large (it pulls in torch), and its model
-runner needs the llama.cpp server binary — without it Marker installs cleanly
-and then fails on the first equation, so `doctor` checks for both:
+---
+
+## Marker support
+
+The high-quality extraction tier is optional.
 
 ```bash
 .venv/bin/pip install -e '.[marker]'
+
 brew install llama.cpp
 ```
 
-The first Marker run downloads several GB of models before it does any work.
+The first Marker run may download several gigabytes of models.
 
-### Optional deterministic Greek prose repair
+`pdf-library doctor` checks that the required dependencies are available.
 
-`pdf-library repair` can also correct known handwritten-OCR substitutions in
-ordinary Greek prose. For the full inflection-aware mode, install `spylls` and
-put `Greek.aff` plus `Greek.dic` at `<library root>/dictionaries/Greek.*`.
-Point `greek_hunspell` elsewhere only when you need a custom location. A plain
-UTF-8 wordlist remains available as a smaller fallback:
+---
+
+## Optional Greek spell repair
+
+For the complete inflection-aware deterministic repair mode, install:
 
 ```bash
 .venv/bin/pip install -e '.[spellcheck]'
 ```
 
+Place:
+
+```text
+Greek.aff
+Greek.dic
+```
+
+at:
+
+```text
+<library root>/dictionaries/Greek.*
+```
+
+or configure another path:
+
 ```toml
 [repair]
+
 greek_lexicon = "/absolute/path/to/greek-words.txt"
 greek_hunspell = "/absolute/path/to/Greek"
 ```
 
-It changes a word only when exactly one word in that list is reachable through
-the documented Greek handwriting confusions; it never changes text inside math
-delimiters. Every accepted correction is printed as an audit entry.
+Corrections are deliberately conservative.
+
+A word is changed only when the configured repair system finds a sufficiently constrained candidate.
+
+Mathematical spans are not modified by prose repair.
 
 ---
 
-## Command line
+# Command line
 
 ```bash
+# Import one document
 pdf-library import ~/books/real-analysis.pdf
-pdf-library import ~/books/                    # a whole directory
+
+# Import a directory
+pdf-library import ~/books/
+
+# List documents
 pdf-library list
+
+# Search
 pdf-library search "dominated convergence"
+
+# Read specific pages
 pdf-library page real-analysis 243 244
+
+# Retrieve a section
 pdf-library section real-analysis "Dominated Convergence"
+
+# Inspect quality problems
 pdf-library report real-analysis --problems-only
+
+# Upgrade one page with Marker
 pdf-library reprocess real-analysis --pages 243
-pdf-library repair real-analysis               # Greek notation, no OCR
-pdf-library blocks real-analysis 243           # laid-out regions of a page
-pdf-library image real-analysis 243 --block 2  # crop one region to a JPEG
+
+# Apply deterministic repair without OCR
+pdf-library repair real-analysis
+
+# Inspect detected page blocks
+pdf-library blocks real-analysis 243
+
+# Render one block
+pdf-library image real-analysis 243 --block 2
+
+# Rebuild indexes without re-extracting
 pdf-library reindex --all
+
+# Environment and dependency checks
 pdf-library doctor
 ```
 
-`tools/proofread.py <document>` writes a self-contained HTML page with each
-original page beside the extracted Markdown, LaTeX typeset — the only reliable
-way to judge extraction quality is to look at it.
+---
+
+# Proofreading
+
+The repository contains:
+
+```bash
+tools/proofread.py <document>
+```
+
+It generates a self-contained HTML proofreader showing:
+
+```text
+original page | extracted Markdown
+```
+
+with LaTeX rendered.
+
+For extraction quality, side-by-side visual comparison remains the most trustworthy test.
 
 ---
 
-## Claude Code and Claude Desktop
+# MCP setup
+
+## Claude Code
 
 ```bash
 claude mcp add pdf-library -- /absolute/path/to/.venv/bin/pdf-library-mcp
 ```
 
-`import_pdf` and `reprocess` return a job id. Poll `job_status(job_id)` until
-it returns the document id, then use `document_status` for the quality report.
+---
 
-For Claude Desktop, in `claude_desktop_config.json`:
+## Claude Desktop
+
+Add the server to `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "pdf-library": {
       "command": "/absolute/path/to/.venv/bin/pdf-library-mcp",
-      "env": { "PDF_LIBRARY_ROOT": "~/Documents/pdf-library" }
+      "env": {
+        "PDF_LIBRARY_ROOT": "/Users/you/Documents/pdf-library"
+      }
     }
   }
 }
 ```
 
-### Tools
+Restart Claude Desktop after changing the configuration or adding new MCP tools.
 
-| Tool | Returns |
+---
+
+# MCP tools
+
+| Tool | Purpose |
 | --- | --- |
-| `import_pdf` | Starts a background import, or reports a cache hit immediately |
-| `search_library` | Headings, pages and snippets. Accent- and inflection-insensitive |
-| `get_pages` | Markdown for named pages only |
-| `get_chunk` | One chunk — a theorem, a proof, a definition |
-| `get_section` | Every chunk under one heading |
-| `list_documents` | The library, metadata only |
-| `document_status` | Progress, quality report, pages worth upgrading |
-| `get_page_image` | The original page, or one cropped block, as an image. Opt-in and priced |
-| `ocr_review_queue` | Scan/OCR pages that need image-to-text verification |
-| `review_ocr_page` | One original page image alongside its saved transcription |
-| `record_ocr_review` | Persist an approved, needs-correction, or unreadable verdict |
-| `reprocess` | Re-extracts named pages with Marker |
+| `import_pdf` | Import a PDF in the background or return an existing cached document |
+| `search_library` | Search headings, pages and snippets |
+| `get_pages` | Return Markdown for specific pages |
+| `get_chunk` | Retrieve one semantic chunk |
+| `get_section` | Retrieve the chunks belonging to a section |
+| `list_documents` | List library metadata |
+| `document_status` | Import status and document quality information |
+| `get_page_image` | Return an original page or cropped block |
+| `ocr_review_queue` | List OCR pages awaiting visual verification |
+| `review_ocr_page` | Return the original image together with its transcription |
+| `record_ocr_review` | Store a visual-review verdict |
+| `correct_ocr_page` | Compare one OCR page with the original using the local vision model |
+| `correct_ocr_pages` | Run vision OCR correction across selected pages |
+| `reprocess` | Re-extract selected pages using Marker |
 
-Imports never block the transport: `import_pdf` returns a job id and
-`document_status` reports progress. Responses are trimmed to a configured token
-budget, and content-returning tools label extracted text as untrusted data.
+`import_pdf` and `reprocess` return background job IDs when appropriate.
+
+Use:
+
+```text
+job_status(job_id)
+```
+
+to follow the operation.
 
 ---
 
-## Storage
+# Example vision workflow
 
+Suppose OCR of four handwritten mathematics pages looks suspicious.
+
+First ask the local VLM to evaluate them without modifying anything:
+
+```text
+correct_ocr_pages(
+    document="ΜΑΘΗΜΑΤΙΚΑ Ι ΜΑΘΗΜΑ 10.pdf",
+    pages=[1, 2, 3, 4],
+    apply=false
+)
 ```
+
+Inspect the proposed corrections.
+
+Then:
+
+```text
+correct_ocr_pages(
+    document="ΜΑΘΗΜΑΤΙΚΑ Ι ΜΑΘΗΜΑ 10.pdf",
+    pages=[1, 2, 3, 4],
+    apply=true
+)
+```
+
+Accepted pages are:
+
+1. written back as canonical Markdown
+2. recorded in the correction audit history
+3. rebuilt into `document.md`
+4. reindexed for search
+
+The previous transcription remains recorded.
+
+---
+
+# Storage
+
+Default layout:
+
+```text
 ~/Documents/pdf-library/
-├── library.db                  SQLite: documents, pages, chunks, FTS5, jobs
-└── documents/<document_id>/
-    ├── source.pdf
-    ├── document.md
-    ├── metadata.json
-    └── pages/0001.md ...
+│
+├── library.db
+│
+└── documents/
+    └── <document_id>/
+        ├── source.pdf
+        ├── document.md
+        ├── metadata.json
+        └── pages/
+            ├── 0001.md
+            ├── 0002.md
+            └── ...
 ```
 
-Page files are both the unit of caching and the unit of retrieval, which is what
-makes single-page reprocessing possible.
+SQLite stores:
+
+- documents
+- pages
+- chunks
+- FTS search data
+- jobs
+- OCR reviews
+- vision correction provenance
+
+Page files are both the caching unit and retrieval unit.
+
+That is what makes single-page replacement possible.
 
 ---
 
-## Scanned and handwritten documents
+# Scanned and handwritten documents
 
-A page with no text layer produces nothing at the fast tier. It is recorded as
-scanned and flagged for upgrade, not silently returned as an empty page.
+A page without a usable text layer is not silently treated as an empty page.
 
-On handwritten Greek lecture notes Marker recovers the mathematics well —
-nested subscripts such as `\frac{A_{2,m_2}}{(x-r_2)^{m_2}}` come through intact
-— while the surrounding prose keeps a steady rate of character confusions (γ
-read as χ, η as υ). Stemmed search absorbs some of that; exact quotation of
-OCR'd handwriting does not.
+It is marked as scanned and becomes eligible for OCR/high-quality processing.
 
-One error class deserves a warning: **underbrace annotations can be read as
-fractions**. A term with `f(x)` and `g'(x)` labelled underneath it may be
-extracted as a fraction with those labels as the denominator. The result is
-syntactically valid LaTeX and no automated check can catch it, so read pages
-with underbraces against the original.
+Handwritten Greek remains one of the hardest cases.
 
----
+Marker often recovers mathematical structure surprisingly well, including expressions such as:
 
-## Configuration
+```latex
+\frac{A_{2,m_2}}{(x-r_2)^{m_2}}
+```
 
-See `config.example.toml`. Override the library root with `$PDF_LIBRARY_ROOT`,
-or the config file with `$PDF_LIBRARY_CONFIG`. Nothing is hard-coded.
+while surrounding prose can still contain character substitutions.
 
-Changing how text is normalised invalidates existing indexes; `doctor` detects
-that and `pdf-library reindex --all` rebuilds them without re-extracting any
-PDF.
+The local vision layer exists specifically for the cases where text-only post-processing has reached its limit.
 
 ---
 
-## Tests
+# Configuration
+
+See:
+
+```text
+config.example.toml
+```
+
+The library root can be overridden with:
+
+```bash
+PDF_LIBRARY_ROOT=/path/to/library
+```
+
+and the configuration file with:
+
+```bash
+PDF_LIBRARY_CONFIG=/path/to/config.toml
+```
+
+Nothing is hard-coded.
+
+Changes to text normalization may invalidate existing search indexes.
+
+Run:
+
+```bash
+pdf-library doctor
+```
+
+to detect problems and:
+
+```bash
+pdf-library reindex --all
+```
+
+to rebuild search data without reprocessing the PDFs.
+
+---
+
+# Tests
+
+Run:
 
 ```bash
 .venv/bin/python -m pytest tests -q
 ```
 
-138 tests. Fixtures are compiled from LaTeX so the mathematics has a known
-ground truth; regenerate them with `python tests/fixtures/make_fixtures.py`.
+Fixtures include compiled LaTeX documents so mathematical extraction can be compared against known source material.
 
-The suite covers the promises that matter: a second import runs no engine, a
-digital PDF triggers no OCR, a display equation is never split across chunks,
-Greek queries match across inflections and across OCR damage, an exact match is
-never reported as approximate, images stay inside their token budget, and every
-MCP tool answers within its own.
+The test suite covers core guarantees such as:
 
----
-
-## Deliberately not included
-
-Not because they are bad ideas, but because they were not needed to make the
-thing work well:
-
-- A vector database. SQLite FTS5 with proper normalisation answers these
-  queries, and semantic search can be added behind the same interface later.
-- An LLM in the default pipeline. The quality gate is deterministic. An LLM
-  belongs on the handful of pages that fail it, opt-in, never on all of them.
-- A third extraction engine. Two tiers cover the range; a third is weight
-  without a measured gain.
-- A bundled third-party spelling dictionary for OCR'd Greek prose. The optional
-  local-wordlist repair is deliberately constrained to one auditable candidate;
-  a broad dictionary will not be bundled without a separate licence review.
-- Anything server-shaped: no Postgres, no queue, no web frontend. It is a local
-  tool for one person's bookshelf.
+- cached imports do not invoke extraction again
+- digital PDFs do not unnecessarily trigger OCR
+- display equations remain intact across chunks
+- Greek search works across inflection
+- approximate OCR search does not outrank exact search
+- rendered images respect their token budget
+- MCP tools respect their response budgets
+- vision OCR provenance is preserved
+- low-confidence vision output does not silently replace canonical text
 
 ---
 
-## Where this is going
+# Design principles
 
-`docs/NEXT.md` carries the agreed next steps and the decisions behind them.
+## Local first
 
-## Licence
+Documents, indexes, OCR and optional vision inference stay on the user's machine.
 
-This project's own source is MIT — see `LICENSE`, which also documents the
-copyleft terms of the extraction engines it drives. PyMuPDF is AGPL-3.0 and is a
-required dependency; Marker is GPL-3.0 with a commercial-use condition, is
-optional, and runs as a subprocess rather than being imported.
+## Extraction is expensive. Retrieval should not be.
+
+Run extraction once.
+
+Reuse the result indefinitely.
+
+## Page-level quality beats whole-document perfection
+
+Do not spend hours rerunning an 800-page book because three pages are bad.
+
+## The original PDF remains the source of truth
+
+Every automated extraction layer can be wrong.
+
+The original page image is always available for verification.
+
+## Corrections require provenance
+
+The system keeps the previous transcription and records how a replacement was produced.
+
+## Deterministic fixes before generative fixes
+
+Known problems such as Greek normalization and closed mathematical notation sets are handled deterministically where possible.
+
+Vision models are reserved for cases where visual understanding actually adds information.
+
+---
+
+# Deliberately not included
+
+This project intentionally avoids several pieces of infrastructure that are not currently necessary.
+
+### Vector database
+
+SQLite FTS5 with language-aware normalization already handles the intended library queries.
+
+Semantic/vector search can be added later behind the same retrieval interface.
+
+### Cloud OCR as a requirement
+
+The project is designed to remain usable locally.
+
+Vision correction can run entirely on Apple Silicon through MLX-VLM.
+
+### Automatic LLM rewriting of every page
+
+A vision model is not part of the mandatory import path.
+
+It is an optional correction layer for pages that justify the additional cost.
+
+### A third traditional extraction engine
+
+PyMuPDF4LLM and Marker already cover the fast/high-quality extraction split.
+
+Another extractor should only be added if benchmarks show a concrete advantage.
+
+### Postgres, Redis, workers or a web application
+
+This is a local tool for one person's document library.
+
+SQLite and the filesystem are enough.
+
+---
+
+# Project direction
+
+See:
+
+```text
+docs/NEXT.md
+```
+
+for planned work and design decisions.
+
+Potential future areas include:
+
+- automatic routing of suspicious OCR pages to the local vision model
+- richer vision-model benchmarking
+- additional MLX-VLM model profiles
+- equation-level confidence reporting
+- optional semantic retrieval
+- richer document provenance inspection
+
+---
+
+# Licence
+
+The source code in this repository is licensed under the MIT License.
+
+See `LICENSE` for details and for information about licenses of optional or required extraction dependencies.
+
+The project orchestrates external extraction engines behind interfaces so that the document-library layer remains independent of any single extractor.

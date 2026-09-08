@@ -20,3 +20,7 @@ pdf-library/
 # Proofreading pages embed the source document as images
 *-proofread.html
 proofread.html
+
+# Local OCR comparison artifacts and model outputs
+comparison/
+mlx-vlm-pages-1-4-results.md

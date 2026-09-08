@@ -30,7 +30,7 @@ class ExtractionConfig:
     # Also upgrade any page holding math, regardless of score.
     upgrade_math_pages: bool = True
     # Start the upgrade automatically after a successful import.
-    auto_upgrade: bool = False
+    auto_upgrade: bool = True
     # Cap on pages sent to the quality engine in one upgrade job (0 = no cap).
     max_upgrade_pages: int = 0
 
@@ -43,6 +43,22 @@ class MarkerConfig:
     torch_device: str = ""
     timeout_seconds: int = 3600
     extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    """Local MLX-VLM correction settings."""
+
+    enabled: bool = True
+    base_url: str = "http://127.0.0.1:8080/v1"
+    model: str = "mlx-community/Qwen3-VL-8B-Instruct-4bit"
+    timeout_seconds: int = 300
+    render_scale: float = 3.0
+    temperature: float = 0.0
+    max_tokens: int = 4096
+    apply_min_confidence: float = 0.80
+    crop_retry: bool = True
+    min_greek_ratio: float = 0.35
 
 
 @dataclass(frozen=True)
@@ -95,6 +111,7 @@ class Config:
     root: Path = DEFAULT_ROOT
     extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
     marker: MarkerConfig = field(default_factory=MarkerConfig)
+    vision: VisionConfig = field(default_factory=VisionConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     response: ResponseConfig = field(default_factory=ResponseConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
@@ -144,6 +161,7 @@ def load_config(path: Path | None = None) -> Config:
         root=root,
         extraction=_apply(ExtractionConfig(), _section(data, "extraction")),
         marker=_apply(MarkerConfig(), _section(data, "marker")),
+        vision=_apply(VisionConfig(), _section(data, "vision")),
         search=_apply(SearchConfig(), _section(data, "search")),
         response=_apply(ResponseConfig(), _section(data, "response")),
         chunking=_apply(ChunkingConfig(), _section(data, "chunking")),

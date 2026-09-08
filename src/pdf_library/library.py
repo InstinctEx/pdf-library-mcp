@@ -32,6 +32,7 @@ from .storage import DocumentStore
 from .spellfix import repair_greek_prose
 from .textfix import rejoin_hyphenation
 from .tokens import estimate_tokens
+from .vision import VisionEngine
 
 ProgressFn = Callable[[float, str], None]
 
@@ -1097,6 +1098,152 @@ class Library:
             "pages": pages,
         }
 
+    def correct_ocr_pages(
+        self,
+        document_ref: str,
+        pages: Iterable[int] | None = None,
+        apply: bool = True,
+        progress: ProgressFn = _noop,
+    ) -> dict[str, Any]:
+        """Verify scanned/OCR pages with the configured local vision model."""
+        row = self.resolve(document_ref)
+        provided = sorted({int(p) for p in pages}) if pages is not None else []
+        if provided:
+            invalid = [p for p in provided if p < 1 or p > row["page_count"]]
+            if invalid:
+                raise LibraryError(f"invalid page(s) {invalid}; valid range is 1-{row['page_count']}")
+            targets = provided
+        else:
+            targets = [r[0] for r in self.conn.execute(
+                "SELECT page_number FROM pages WHERE document_id=? AND (source_scanned=1 OR ocr_used=1) ORDER BY page_number",
+                (row["id"],),
+            ).fetchall()]
+        if not targets:
+            return {"document_id": row["id"], "pages": [], "applied": []}
+        vision = VisionEngine(self.config.vision)
+        ok, reason = vision.available()
+        if not ok:
+            store = self.store(row["id"])
+            for page in targets:
+                original = store.read_page(page) or ""
+                self.conn.execute(
+                    "INSERT INTO vision_corrections (document_id, page_number, original_markdown, proposed_markdown, model, confidence, warnings, applied, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (row["id"], page, original, "", self.config.vision.model, 0.0,
+                     json.dumps([reason], ensure_ascii=False), 0, _now()),
+                )
+                self.conn.execute(
+                    "UPDATE pages SET verification_state='pending', verification_note=? WHERE document_id=? AND page_number=?",
+                    (reason, row["id"], page),
+                )
+            return {
+                "document_id": row["id"], "pages": targets, "applied": [],
+                "corrections": [
+                    {"page": page, "confidence": 0.0, "applied": False, "warnings": [reason]}
+                    for page in targets
+                ],
+                "warning": reason,
+            }
+        store = self.store(row["id"])
+        corrections = []
+        applied = []
+        total = max(len(targets), 1)
+        for index, page in enumerate(targets, start=1):
+            original = store.read_page(page) or ""
+            try:
+                correction = vision.correct(store.source_pdf, page, original)
+            except EngineUnavailable as exc:
+                warning = str(exc)
+                self.conn.execute(
+                    "INSERT INTO vision_corrections (document_id, page_number, original_markdown, proposed_markdown, model, confidence, warnings, applied, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (row["id"], page, original, "", self.config.vision.model, 0.0,
+                     json.dumps([warning], ensure_ascii=False), 0, _now()),
+                )
+                self.conn.execute(
+                    "UPDATE pages SET verification_state='pending', verification_note=? WHERE document_id=? AND page_number=?",
+                    (warning, row["id"], page),
+                )
+                corrections.append({"page": page, "confidence": 0.0, "applied": False, "warnings": [warning]})
+                progress(index / total, f"vision page {index}/{total} unavailable")
+                continue
+            greek_document = row["language"] == "ell" or self._text_is_greek(original)
+            warnings = VisionEngine.validate(
+                original, correction, greek_document=greek_document,
+                min_greek_ratio=self.config.vision.min_greek_ratio,
+            )
+            if warnings and self.config.vision.crop_retry:
+                try:
+                    retry = vision.correct(store.source_pdf, page, original, enhanced=True)
+                except EngineUnavailable:
+                    retry = None
+                if retry is not None:
+                    retry_warnings = VisionEngine.validate(
+                        original, retry, greek_document=greek_document,
+                        min_greek_ratio=self.config.vision.min_greek_ratio,
+                    )
+                    if len(retry_warnings) < len(warnings):
+                        correction, warnings = retry, retry_warnings
+            accepted = (
+                not warnings
+                and correction.confidence >= self.config.vision.apply_min_confidence
+            )
+            correction.validation_warnings = warnings
+            self.conn.execute(
+                "INSERT INTO vision_corrections (document_id, page_number, original_markdown, proposed_markdown, model, confidence, warnings, applied, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (row["id"], page, original, correction.markdown, correction.model,
+                 correction.confidence, json.dumps(warnings, ensure_ascii=False),
+                 int(accepted and apply), _now()),
+            )
+            if apply and accepted:
+                store.write_page(page, correction.markdown)
+                quality = assess_page(correction.markdown)
+                self.conn.execute(
+                    "UPDATE pages SET page_hash=?, char_count=?, quality_score=?, quality_state=?, quality_issues=?, math_count=?, verification_state='approved', verification_note=?, verified_at=?, updated_at=? WHERE document_id=? AND page_number=?",
+                    (text_sha256(correction.markdown), quality.char_count, quality.score, quality.state,
+                     json.dumps(quality.issues, ensure_ascii=False), quality.math_count,
+                     "MLX-VLM automatic correction", _now(), _now(), row["id"], page),
+                )
+                applied.append(page)
+            if warnings and not apply:
+                self.conn.execute(
+                    "UPDATE pages SET verification_state='needs_correction', verification_note=? WHERE document_id=? AND page_number=?",
+                    ("; ".join(warnings), row["id"], page),
+                )
+            elif warnings:
+                self.conn.execute(
+                    "UPDATE pages SET verification_state='needs_correction', verification_note=? WHERE document_id=? AND page_number=?",
+                    ("; ".join(warnings), row["id"], page),
+                )
+            corrections.append({"page": page, "confidence": correction.confidence, "applied": accepted and apply, "warnings": warnings})
+            progress(index / total, f"vision page {index}/{total}")
+        if applied:
+            self.reindex_document(row["id"])
+            store.rebuild_document_md(title=row["title"])
+        return {"document_id": row["id"], "pages": targets, "applied": applied, "corrections": corrections}
+
+    def vision_correction_history(
+        self, document_ref: str, page: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Return the append-only vision correction audit trail."""
+        row = self.resolve(document_ref)
+        sql = "SELECT * FROM vision_corrections WHERE document_id=?"
+        params: list[Any] = [row["id"]]
+        if page is not None:
+            sql += " AND page_number=?"
+            params.append(int(page))
+        sql += " ORDER BY id"
+        return [
+            {
+                "id": item["id"], "page": item["page_number"],
+                "model": item["model"], "confidence": item["confidence"],
+                "warnings": json.loads(item["warnings"] or "[]"),
+                "applied": bool(item["applied"]),
+                "original_markdown": item["original_markdown"],
+                "proposed_markdown": item["proposed_markdown"],
+                "created_at": item["created_at"],
+            }
+            for item in self.conn.execute(sql, params).fetchall()
+        ]
+
     def record_ocr_review(
         self,
         document_ref: str,
@@ -1338,6 +1485,14 @@ class Library:
                 "verification_approved_pages": self._pages_where(
                     "verification_state = 'approved'", row["id"]
                 ),
+                "vision_corrections": self.conn.execute(
+                    "SELECT COUNT(*) FROM vision_corrections WHERE document_id=?",
+                    (row["id"],),
+                ).fetchone()[0],
+                "vision_corrections_applied": self.conn.execute(
+                    "SELECT COUNT(*) FROM vision_corrections WHERE document_id=? AND applied=1",
+                    (row["id"],),
+                ).fetchone()[0],
                 "low_quality_pages": self._pages_where(
                     "quality_state IN ('warning','bad')", row["id"]
                 ),

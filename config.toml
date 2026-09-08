@@ -13,8 +13,9 @@ quality_engine = "marker"
 upgrade_below_score = 0.75
 # Offer every page holding mathematics, not only the low-scoring ones.
 upgrade_math_pages = true
-# Upgrade automatically after import. Off by default: it is slow.
-auto_upgrade = false
+# Upgrade automatically after import. This also runs local vision correction
+# for scanned/OCR pages when the MLX-VLM server is available.
+auto_upgrade = true
 # Cap pages sent to the quality engine per job. 0 means no cap.
 max_upgrade_pages = 0
 
@@ -38,6 +39,8 @@ temperature = 0.0
 max_tokens = 4096
 # Corrected text is only written when confidence meets this threshold.
 apply_min_confidence = 0.80
+crop_retry = true
+min_greek_ratio = 0.35
 
 [search]
 max_results = 10

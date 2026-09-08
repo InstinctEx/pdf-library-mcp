@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Bumped whenever the text written into the FTS index changes shape, which
 # makes every existing index stale until the documents are reindexed.
 INDEX_VERSION = 3
@@ -166,6 +166,22 @@ CREATE TABLE IF NOT EXISTS engine_runs (
     error         TEXT,
     created_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS vision_corrections (
+    id INTEGER PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL,
+    original_markdown TEXT NOT NULL,
+    proposed_markdown TEXT NOT NULL,
+    model TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    warnings TEXT NOT NULL DEFAULT '[]',
+    applied INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vision_corrections_page
+    ON vision_corrections(document_id, page_number, created_at);
 """
 
 

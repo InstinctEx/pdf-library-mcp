@@ -1,11 +1,11 @@
 # MLX-VLM OCR correction
 
-This build adds an optional local vision verification/correction stage for scanned and handwritten PDF pages.
+This build adds a local vision verification/correction stage for scanned and handwritten PDF pages.
 
 ## What changed
 
 - New `VisionConfig` section with MLX-VLM endpoint/model/render/confidence settings.
-- New `MLXVLMEngine` using the local OpenAI-compatible `/v1/chat/completions` API.
+- New `VisionEngine` using the local OpenAI-compatible `/v1/chat/completions` API.
 - Strict Greek + mathematical transcription prompt with JSON-schema output.
 - New lossless high-resolution `render_for_ocr()` path; it is separate from MCP's token-budgeted page renderer.
 - New `vision_corrections` SQLite audit table preserving the prior and proposed Markdown, model, confidence, warnings, status, timestamp and whether a correction was applied.
@@ -13,6 +13,10 @@ This build adds an optional local vision verification/correction stage for scann
 - New MCP tools `correct_ocr_page` and `correct_ocr_pages`.
 - Confident corrections update page Markdown, document Markdown, quality metadata and the search index.
 - Low-confidence/uncertain results never overwrite canonical page text and remain in the OCR review queue.
+- Transliteration, malformed LaTeX, missing formulas, and suspiciously short
+  output are rejected automatically.
+- If MLX-VLM is unavailable, Marker remains canonical and the page stays pending
+  review; the import itself is not failed.
 - New vision tests and updated MCP tool registration test.
 
 ## Mac setup
@@ -43,6 +47,11 @@ apply_min_confidence = 0.80
 Restart `pdf-library-mcp` after changing the configuration.
 
 ## MCP usage
+
+New imports automatically run fast extraction, Marker upgrades for candidate
+pages, and MLX-VLM correction for scanned/OCR pages. Correction is conservative:
+every proposal is audited, but only validated high-confidence output becomes
+canonical Markdown.
 
 Dry-run one page first:
 

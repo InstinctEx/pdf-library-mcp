@@ -158,6 +158,11 @@ def import_job(pdf_path: Path, force: bool = False, auto_upgrade: bool = False) 
             payload["upgrade"] = library.upgrade_pages(
                 result.document_id, result.upgrade_candidates, progress=report
             )
+        if auto_upgrade:
+            report(0.0, "vision correction")
+            payload["vision"] = library.correct_ocr_pages(
+                result.document_id, apply=True, progress=report
+            )
         return payload
 
     return body
@@ -167,8 +172,24 @@ def upgrade_job(
     document_id: str, pages: list[int] | None, engine: str | None
 ) -> JobBody:
     def body(library: Library, report: Callable[[float, str], None]) -> dict[str, Any]:
-        return library.upgrade_pages(
+        result = library.upgrade_pages(
             document_id, pages=pages, engine_name=engine, progress=report
+        )
+        if result.get("pages") and library.config.vision.enabled:
+            result["vision"] = library.correct_ocr_pages(
+                document_id, pages=result["pages"], apply=True, progress=report
+            )
+        return result
+
+    return body
+
+
+def vision_job(
+    document_id: str, pages: list[int] | None, apply: bool
+) -> JobBody:
+    def body(library: Library, report: Callable[[float, str], None]) -> dict[str, Any]:
+        return library.correct_ocr_pages(
+            document_id, pages=pages, apply=apply, progress=report
         )
 
     return body

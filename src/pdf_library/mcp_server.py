@@ -22,7 +22,7 @@ from mcp.server.mcpserver import Image, MCPServer
 
 from .config import Config, load_config
 from .engines import EngineUnavailable, get_engine
-from .jobs import JobRunner, import_job, upgrade_job
+from .jobs import JobRunner, import_job, upgrade_job, vision_job
 from .library import Library, LibraryError
 from .tokens import truncate_to_tokens
 
@@ -33,10 +33,11 @@ Markdown with LaTeX and cached on disk.
 Work in this order:
   1. `search_library` to find where something is discussed.
   2. `get_pages` or `get_chunk` to read only what the search pointed at.
-  3. Before relying on a scan-derived passage, check `ocr_review_queue`. For
-     each page you use, call `review_ocr_page`, compare image and transcript,
-     then call `record_ocr_review`. Never claim a page was visually checked
-     unless you actually received its image in this conversation.
+  3. Scan-derived passages are automatically sent through Marker and, when
+     available, the local MLX-VLM validator. Check `ocr_review_queue` before
+     relying on pages that remain pending or were rejected. Never claim a page
+     was visually checked unless you actually received its image in this
+     conversation.
 
 Never ask for a whole document. A single textbook is hundreds of thousands of
 tokens; the tools are built so you never need more than a few pages. Import
@@ -460,6 +461,45 @@ def ocr_review_queue(document: str, limit: int = 10) -> str:
         lines.append(f"p{item['page']} [{item['state']}, quality {score}] — {reason}")
     lines.append("Use review_ocr_page on one page, then record_ocr_review.")
     return "\n".join(lines)
+
+
+@server.tool(
+    name="correct_ocr_pages",
+    description=(
+        "Run the local MLX-VLM against scanned/OCR pages, validate its proposed "
+        "Markdown, and apply only safe high-confidence corrections. Rejected "
+        "proposals remain in the review queue. Runs as a background job."
+    ),
+)
+def correct_ocr_pages(
+    document: str, pages: list[int] | None = None, apply: bool = True
+) -> str:
+    """Correct selected OCR pages with the local vision model."""
+    library = _library()
+    try:
+        row = library.resolve(document)
+        document_id = row["id"]
+    except LibraryError as exc:
+        return str(exc)
+    finally:
+        library.close()
+    job_id = _jobs().submit(
+        "vision", document_id, vision_job(document_id, pages, apply)
+    )
+    target = "selected pages" if pages else "all scanned/OCR pages"
+    return f"Vision correction started for {target} (job {job_id}). Poll job_status."
+
+
+@server.tool(
+    name="correct_ocr_page",
+    description=(
+        "Run local MLX-VLM correction on one OCR page. The page image is "
+        "authoritative; malformed, transliterated, incomplete, or low-confidence "
+        "results are rejected and preserved for review. Runs as a background job."
+    ),
+)
+def correct_ocr_page(document: str, page: int, apply: bool = True) -> str:
+    return correct_ocr_pages(document, pages=[int(page)], apply=apply)
 
 
 # ----------------------------------------------------------------------

@@ -45,6 +45,8 @@ def test_tools_are_registered(server: Config) -> None:
         "get_page_image",
         "review_ocr_page",
         "ocr_review_queue",
+        "correct_ocr_pages",
+        "correct_ocr_page",
         "record_ocr_review",
         "list_documents",
         "document_status",

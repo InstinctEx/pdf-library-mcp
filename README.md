@@ -165,7 +165,9 @@ The rest of the document remains untouched.
 
 For difficult scanned or handwritten material, Marker is not always enough.
 
-The library can optionally send the original page image together with the existing OCR transcription to a **local Vision Language Model running through MLX-VLM**.
+The library sends scanned/OCR pages to a **local Vision Language Model running
+through MLX-VLM** after Marker. The image is authoritative and the proposed
+Markdown must pass deterministic validation before replacing the Marker text.
 
 This is particularly useful for:
 

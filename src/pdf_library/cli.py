@@ -56,6 +56,14 @@ def cmd_import(args: argparse.Namespace, library: Library) -> int:
                   f"({result.page_count}p, {result.equation_count} equations)")
             continue
 
+        if library.config.extraction.auto_upgrade and result.upgrade_candidates:
+            print(f"  automatically upgrading {len(result.upgrade_candidates)} page(s)")
+            library.upgrade_pages(
+                result.document_id, result.upgrade_candidates, progress=_progress
+            )
+            print("  automatically correcting scanned/OCR pages with MLX-VLM")
+            library.correct_ocr_pages(result.document_id, apply=True, progress=_progress)
+
         print(
             f"{result.filename}: {result.page_count}p in {result.duration_s}s "
             f"[{result.kind}] engine={result.engine} "
@@ -169,6 +177,10 @@ def cmd_reprocess(args: argparse.Namespace, library: Library) -> int:
         engine_name=args.engine,
         progress=_progress,
     )
+    if result.get("pages") and library.config.vision.enabled:
+        result["vision"] = library.correct_ocr_pages(
+            result["document_id"], pages=result["pages"], apply=True, progress=_progress
+        )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

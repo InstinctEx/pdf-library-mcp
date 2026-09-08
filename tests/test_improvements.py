@@ -11,6 +11,7 @@ from pdf_library.config import Config
 from pdf_library.jobs import JobRunner
 from pdf_library.library import Library, LibraryError
 from pdf_library.quality import assess_page
+from pdf_library.vision import VisionCorrection, VisionEngine
 
 
 def test_contradictory_definition_is_flagged_without_rewriting() -> None:
@@ -187,6 +188,77 @@ def test_visual_ocr_review_queue_and_verdicts_are_persisted(
     status = library.status(document.document_id)
     assert page in status["verification_approved_pages"]
     assert page not in status["verification_pending_pages"]
+
+
+def test_vision_correction_applies_and_reindexes(
+    library: Library, scanned_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = library.import_pdf(scanned_pdf)
+    store = library.store(document.document_id)
+    store.write_page(1, "Η συνάρτηση είναι $f(x)=x$")
+
+    monkeypatch.setattr(VisionEngine, "available", lambda self: (True, "test-model"))
+    monkeypatch.setattr(
+        VisionEngine,
+        "correct",
+        lambda self, pdf, page, transcript, enhanced=False: VisionCorrection(
+            page, "Η συνάρτηση είναι $f(x)=x+1$", 0.99, [], "test-model", []
+        ),
+    )
+    result = library.correct_ocr_pages(document.document_id, pages=[1], apply=True)
+
+    assert result["applied"] == [1]
+    assert "x+1" in (store.read_page(1) or "")
+    assert library.conn.execute("SELECT COUNT(*) FROM chunks WHERE document_id=?", (document.document_id,)).fetchone()[0] > 0
+    history = library.vision_correction_history(document.document_id, page=1)
+    assert history[-1]["applied"] is True
+
+
+def test_vision_rejects_latin_transliteration_and_keeps_marker(
+    library: Library, scanned_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = library.import_pdf(scanned_pdf)
+    store = library.store(document.document_id)
+    original = "Η συνάρτηση είναι $f(x)=x$"
+    store.write_page(1, original)
+
+    monkeypatch.setattr(VisionEngine, "available", lambda self: (True, "test-model"))
+    monkeypatch.setattr(
+        VisionEngine,
+        "correct",
+        lambda self, pdf, page, transcript, enhanced=False: VisionCorrection(
+            page, "h autigropu tus $f(x)=x$", 0.99, [], "test-model", []
+        ),
+    )
+    result = library.correct_ocr_pages(document.document_id, pages=[1], apply=True)
+
+    assert result["applied"] == []
+    assert store.read_page(1) == original
+    assert "latin_transliteration_detected" in result["corrections"][0]["warnings"]
+    assert library.vision_correction_history(document.document_id, page=1)[-1]["applied"] is False
+
+
+def test_vision_unavailable_keeps_marker_and_returns_warning(
+    library: Library, scanned_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = library.import_pdf(scanned_pdf)
+    monkeypatch.setattr(VisionEngine, "available", lambda self: (False, "server offline"))
+
+    result = library.correct_ocr_pages(document.document_id, pages=[1], apply=True)
+
+    assert result["applied"] == []
+    assert result["warning"] == "server offline"
+    assert library.vision_correction_history(document.document_id, page=1)[-1]["applied"] is False
+
+
+def test_vision_validator_rejects_malformed_latex_and_missing_formulas() -> None:
+    original = "Η σχέση $f(x)=\\frac{1}{x}$ και $g(x)=\\sqrt{x}$"
+    candidate = VisionCorrection(
+        1, "Η σχέση $f(x)=\\frac{1}{x", 0.99, [], "test-model", []
+    )
+    warnings = VisionEngine.validate(original, candidate, greek_document=True)
+    assert "unbalanced_math_delimiters" in warnings
+    assert any(item.startswith("formula_inventory_dropped") for item in warnings)
 
 
 def test_import_enforces_configured_resource_limits(
